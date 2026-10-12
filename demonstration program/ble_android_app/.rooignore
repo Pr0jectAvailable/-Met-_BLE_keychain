@@ -1,0 +1,23 @@
+# Нативные платформы, для задачи на Dart они не нужны
+ios/
+macos/
+linux/
+windows/
+web/
+
+# Сборка и кеши
+build/
+.dart_tool/
+.gradle/
+.kotlin/
+
+# Бинарные файлы
+*.png
+*.jpg
+*.jpeg
+*.ico
+*.keystore
+*.jks
+
+# Служебные
+.git/

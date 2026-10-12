@@ -13,12 +13,17 @@ void setup() {
 
     InternalFS.begin();
     SettingsModule::begin();
+    StorageModule::begin();
     BLEModule::begin();
     BLEUartModule::begin();
 }
 
 void loop() {
+    // txPump() внутри BLEUartModule::loop() продвигает отправку ответов
+    // небольшими порциями, поэтому цикл должен крутиться часто. Большой
+    // delay() здесь раньше «душил» TX: notify уходили с задержкой и рвались.
     BLEUartModule::loop();
+    StorageModule::loop();   // отложенная запись журнала (dirty debounce)
 
     // Печатаем boot-лог, только когда USB CDC реально готов.
     // Serial (как bool) == true, когда хост открыл порт (DTR).
@@ -36,5 +41,5 @@ void loop() {
         LOGLN("===============");
     }
 
-    delay(200);
+    delay(2);
 }

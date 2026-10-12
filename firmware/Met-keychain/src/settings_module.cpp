@@ -5,6 +5,7 @@
 using namespace Adafruit_LittleFS_Namespace;   // <-- ФИКС
 
 const char* SettingsModule::SETTINGS_FILE = "/settings.dat";
+static const char* DEFAULT_NAME = "Tracker";
 char SettingsModule::deviceName[32] = "Tracker";
 uint8_t SettingsModule::macAddr[6] = {0};
 
@@ -17,7 +18,7 @@ void SettingsModule::load() {
 
     if (!file) {
         LOGLN("No settings file -> defaults.");
-        strncpy(deviceName, "Tracker", sizeof(deviceName) - 1);
+        strncpy(deviceName, DEFAULT_NAME, sizeof(deviceName) - 1);
         deviceName[sizeof(deviceName) - 1] = '\0';
         memset(macAddr, 0, 6);
         save();
@@ -42,8 +43,8 @@ void SettingsModule::load() {
     }
 
     if (bad) {
-        LOGLN("Settings corrupted -> reset to 'Tracker'.");
-        strncpy(deviceName, "Tracker", sizeof(deviceName) - 1);
+        LOG("Settings corrupted -> reset to '%s'.\n", DEFAULT_NAME);
+        strncpy(deviceName, DEFAULT_NAME, sizeof(deviceName) - 1);
         deviceName[sizeof(deviceName) - 1] = '\0';
         memset(macAddr, 0, 6);
         save();
@@ -72,18 +73,11 @@ void SettingsModule::setName(const char* name) {
 }
 
 const char* SettingsModule::getName() {
-    // Всегда проверяем и лечим
-    bool empty = true;
-    for (size_t i = 0; i < sizeof(deviceName); i++) {
-        if (deviceName[i] != 0 && deviceName[i] != 0xFF) {
-            empty = false;
-            break;
-        }
-    }
-    if (empty) {
-        strncpy(deviceName, "Tracker", sizeof(deviceName) - 1);
+    // Лечим только реально пустой буфер; иначе возвращаем сохранённое имя.
+    if (deviceName[0] == '\0') {
+        LOG("getName(): empty -> healed to '%s'\n", DEFAULT_NAME);
+        strncpy(deviceName, DEFAULT_NAME, sizeof(deviceName) - 1);
         deviceName[sizeof(deviceName) - 1] = '\0';
-        Serial.println("getName(): healed to 'Tracker'");
     }
     return deviceName;
 }

@@ -1,0 +1,25 @@
+name: Local Dart Config
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Qwen3 14B (chat, edit, agent)
+    provider: ollama
+    model: qwen3:14b
+    roles:
+      - chat
+      - edit
+      - apply
+    capabilities:
+      - tool_use
+    defaultCompletionOptions:
+      contextLength: 16384
+      maxTokens: 2048
+
+  - name: Qwen2.5-Coder 1.5B (autocomplete)
+    provider: ollama
+    model: qwen2.5-coder:1.5b
+    roles:
+      - autocomplete
+    defaultCompletionOptions:
+      contextLength: 4096
