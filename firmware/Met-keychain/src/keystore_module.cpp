@@ -182,6 +182,18 @@ void KeystoreModule::unpair() {
     save();
 }
 
+void KeystoreModule::unbind() {
+    LOGLN("Keystore: unbind, clearing owner binding (provision kept).");
+    memset(s_rec.kOwner, 0, 16);
+    s_rec.flags &= ~0x01;
+    save();
+    // Время живёт только в RAM: после отвязки брелок должен снова молчать,
+    // пока новый владелец не установит время подписанным TIME_SET.
+    s_timeValid = false;
+    s_utcBase = 0;
+    s_utcBaseMs = 0;
+}
+
 void KeystoreModule::factoryReset() {
     LOGLN("Keystore: FACTORY RESET, clearing devNo/K_dev/K_pair/K_owner.");
     // Сохраняем только счётчик seq (он монотонно растёт и не сбрасывается)

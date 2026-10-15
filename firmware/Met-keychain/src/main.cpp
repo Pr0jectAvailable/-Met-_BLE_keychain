@@ -1,6 +1,9 @@
 #include <Arduino.h>
 #include <bluefruit.h>
+#include <InternalFileSystem.h>
 #include "config.h"
+
+using namespace Adafruit_LittleFS_Namespace;
 #include "crypto_module.h"
 #include "keystore_module.h"
 #include "storage_module.h"
@@ -8,7 +11,28 @@
 #include "ble_uart_module.h"
 
 static uint32_t g_resetReas = 0;
-static char g_resetStr[64] = {0};
+static char g_resetStr[96] = {0};
+static uint32_t g_bootCount = 0;
+
+// Persistent boot counter in InternalFS: survives power loss (unlike RAM),
+// so a rapidly increasing value proves the MCU is reset-looping.
+static void bumpBootCount() {
+    static const char* BOOT_FILE = "/bootcnt";
+    uint32_t n = 0;
+    File f = InternalFS.open(BOOT_FILE, FILE_O_READ);
+    if (f) {
+        f.read((uint8_t*)&n, sizeof(n));
+        f.close();
+    }
+    n++;
+    g_bootCount = n;
+    InternalFS.remove(BOOT_FILE);
+    File w = InternalFS.open(BOOT_FILE, FILE_O_WRITE);
+    if (w) {
+        w.write((uint8_t*)&n, sizeof(n));
+        w.close();
+    }
+}
 
 static void logResetReason() {
     uint32_t reas = NRF_POWER->RESETREAS;
@@ -26,9 +50,61 @@ static void logResetReason() {
     if (reas & POWER_RESETREAS_LPCOMP_Msk)    n += snprintf(g_resetStr + n, sizeof(g_resetStr) - n, " LPCOMP");
     if (reas & POWER_RESETREAS_DIF_Msk)       n += snprintf(g_resetStr + n, sizeof(g_resetStr) - n, " DIF");
     if (reas & POWER_RESETREAS_NFC_Msk)       n += snprintf(g_resetStr + n, sizeof(g_resetStr) - n, " NFC");
+    snprintf(g_resetStr + n, sizeof(g_resetStr) - n, " gpregret=0x%08X",
+             (unsigned)NRF_POWER->GPREGRET);
 
     LOGLN(g_resetStr);
     ULOGLN(g_resetStr);
+}
+
+// --- Демо-команды по последовательному порту (USB CDC и UART-зеркало) ---
+// Без аутентификации: "UNBIND" отвязывает владельца (K_owner, флаг paired,
+// журнал, RAM-часы), но СОХРАНЯЕТ провизьон (devNo/K_dev/K_pair) и seq, чтобы
+// брелок можно было привязать заново. "FACTORY_RESET" стирает и провизьон.
+static void handleSerialLine(const char* raw) {
+    char line[32];
+    size_t n = 0;
+    for (const char* p = raw; *p && n < sizeof(line) - 1; p++) {
+        char c = *p;
+        if (c >= 'a' && c <= 'z') c -= 32;
+        line[n++] = c;
+    }
+    line[n] = '\0';
+
+    if (strcmp(line, "UNBIND") == 0) {
+        LOGLN("SERIAL CMD: UNBIND");
+        ULOGLN("SERIAL CMD: UNBIND");
+        KeystoreModule::unbind();
+        StorageModule::clear();
+        BLEModule::restartAdvertising();
+        LOGLN("SERIAL CMD: owner unbound (provision kept)");
+        ULOGLN("SERIAL CMD: owner unbound (provision kept)");
+    } else if (strcmp(line, "FACTORY_RESET") == 0) {
+        LOGLN("SERIAL CMD: FACTORY_RESET");
+        ULOGLN("SERIAL CMD: FACTORY_RESET");
+        KeystoreModule::factoryReset();
+        StorageModule::clear();
+        BLEModule::restartAdvertising();
+        LOGLN("SERIAL CMD: factory reset done");
+        ULOGLN("SERIAL CMD: factory reset done");
+    } else if (strcmp(line, "HELP") == 0) {
+        ULOGLN("SERIAL CMD: UNBIND | FACTORY_RESET");
+        LOGLN("SERIAL CMD: UNBIND | FACTORY_RESET");
+    }
+}
+
+static void pollSerialCommand(Stream& s) {
+    static String buf;
+    while (s.available()) {
+        char c = (char)s.read();
+        if (c == '\n' || c == '\r') {
+            buf.trim();
+            if (buf.length() > 0) handleSerialLine(buf.c_str());
+            buf = "";
+        } else if (buf.length() < 32) {
+            buf += c;
+        }
+    }
 }
 
 void setup() {
@@ -46,6 +122,7 @@ void setup() {
 #endif
 
     InternalFS.begin();
+    bumpBootCount();
     KeystoreModule::begin();
     StorageModule::begin();
     CryptoModule::begin();
@@ -66,8 +143,10 @@ void setup() {
                              BLE_GATTC_WRITE_CMD_TX_QUEUE_SIZE_DEFAULT);
     Bluefruit.begin(1, 1);
 
-    BLEModule::begin();
+    // Регистрируем GATT-сервис UART ДО старта рекламы: иначе стартуем
+    // advertising раньше, чем сервис добавлен в GATT-таблицу.
     BLEUartModule::begin();
+    BLEModule::begin();
 }
 
 void loop() {
@@ -81,6 +160,7 @@ void loop() {
         ULOGLN("====================");
         ULOGLN("=== BOOT ===");
         ULOGLN(g_resetStr);
+        ULOG("bootcnt=%u\n", (unsigned)g_bootCount);
         ULOG("fw=%s proto=%u\n", FW_VERSION, PROTO_VERSION);
         ULOG("dev=%s paired=%u timeok=%u\n", KeystoreModule::devNo(),
              KeystoreModule::paired(), KeystoreModule::timeValid());
@@ -96,6 +176,7 @@ void loop() {
         LOGLN("====================");
         LOGLN("=== BOOT ===");
         LOGLN(g_resetStr);
+        LOG("bootcnt=%u\n", (unsigned)g_bootCount);
         LOG("fw=%s proto=%u\n", FW_VERSION, PROTO_VERSION);
         LOG("dev=%s paired=%u timeok=%u\n", KeystoreModule::devNo(),
             KeystoreModule::paired(), KeystoreModule::timeValid());

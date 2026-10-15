@@ -72,6 +72,8 @@ the phone connects and re-supplies signed time. Encounter timestamps
 | `SET_ADV_TX` | owner | `<dbm>` | `OK` |
 | `SET_SCAN` | owner | `<window_ms> <period_ms>` | `OK` |
 | `UNPAIR` | owner | `<nonce16>` | `RECEIPT <hex32>` |
+| `UNBIND_BEGIN` | — | — | `NONCE <hex16>` — step 1 of K_dev-authenticated owner unbind |
+| `UNBIND_FINISH` | K_dev | `<hmac32>` | `OK dev=<devNo>` — step 2; `HMAC-SHA256(K_dev, nonce)`, clears owner binding + journal, keeps provision |
 
 "owner" = must pass `AUTH` (challenge-response with `K_owner`) in the session
 before the command. `K_owner`/`K_pair` are never sent in clear.
@@ -105,3 +107,20 @@ receipt = HMAC-SHA256(K_rcpt, "unpaired" ‖ devNo ‖ nonce)
 If step 2 fails the server releases the reservation after 10 minutes.
 
 Unpair: nonce from server -> `UNPAIR` -> receipt -> server.
+
+### Owner unbind (no owner required)
+
+`UNPAIR` needs the owner session (`K_owner`) plus a server nonce, so it cannot
+be used to recover a device whose owner key was lost. `UNBIND_BEGIN` /
+`UNBIND_FINISH` instead prove knowledge of `K_dev` (factory/server secret,
+never sent in clear, same primitive as `FACTORY_RESET_FINISH`):
+
+1. Phone/PC: `UNBIND_BEGIN` -> `NONCE <hex16>`.
+2. Compute `HMAC-SHA256(K_dev, nonce)` -> `UNBIND_FINISH <hmac32>` ->
+   `OK dev=<devNo>`.
+
+The device clears `K_owner`, the `paired` flag, the auth session, the RAM clock
+and the encounter journal, but **keeps** `devNo`/`K_dev`/`K_pair` and the
+monotonic `seq`. The unit returns to the pairing beacon and can be paired again
+with the same `K_pair`. Use `FACTORY_RESET_BEGIN`/`FACTORY_RESET_FINISH` when the
+provision itself must also be wiped.

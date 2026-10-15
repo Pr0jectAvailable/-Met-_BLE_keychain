@@ -387,6 +387,14 @@ class _HomePageState extends State<HomePage> {
         }
       }
       final c = client!;
+      // K_dev/демо-подпись относится к конкретному брелоку. При смене
+      // устройства кэш от предыдущего даёт TIME_FAIL (и AUTH_FAIL):
+      // сбрасываем поле и кэш, чтобы K_dev брался заново для этого devNo.
+      if (_deviceNumber != null && _deviceNumber != c.info.dev) {
+        _kDev = null;
+        _kDevCtrl.clear();
+      }
+      _deviceNumber = c.info.dev;
       _device = device;
       _client = c;
       _authed = false;
@@ -513,7 +521,8 @@ class _HomePageState extends State<HomePage> {
     });
     try {
       if (!_authed) await _ensureAuth();
-      const page = 10;
+      // Совпадает с LOG_PAGE_MAX в прошивке (headers/config.h).
+      const page = 6;
       var offset = 0;
       var total = 0;
       final all = <JournalRecord>[];

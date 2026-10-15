@@ -9,9 +9,13 @@ public:
     static void begin();
     static void loop();
     static void restartAdvertising();
+    static void markAdvStopped();
+    static uint32_t advSeen();
+    static uint32_t advRecorded();
 
 private:
     static void scanCallback(ble_gap_evt_adv_report_t* report);
+    static void processScanQueue();
     static void buildAdvertising();
     static void rotateMac();
     static void updateAnonId();

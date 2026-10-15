@@ -3,11 +3,37 @@
 #include "crypto_module.h"
 #include "keystore_module.h"
 #include "storage_module.h"
+#include "ble_uart_module.h"
 
 uint8_t  BLEModule::currentMac[6] = {0};
 uint8_t  BLEModule::anonId[16] = {0};
 uint32_t BLEModule::lastEpoch = 0;
 bool     BLEModule::advRunning = false;
+
+// Диагностика: сколько ADV прошло парс и было записано в журнал.
+static uint32_t s_advSeen = 0;
+static uint32_t s_advRecorded = 0;
+static uint32_t s_rawReports = 0;   // DIAG: все отчёты сканера (до парсинга)
+
+// --- Буфер отчётов сканера (producer/consumer) ---
+// scanCallback() выполняется в контексте события SoftDevice (ISR). Любая
+// блокирующая работа там (Serial LOG, HMAC в computeTag(), запись во
+// flash в save()) срывает тайминги SoftDevice и приводит к сбросу МК.
+// Поэтому колбэк только копирует отчёт в ring-buffer и сразу возвращает
+// управление; разбор/фильтрация/record() делаются в loop().
+struct ScanReport {
+    uint8_t peerMac[6];      // в порядке отображения (addr[5-i])
+    uint8_t payload[16];
+    uint8_t payloadLen;
+    uint8_t type;
+    int8_t  rssi;
+};
+#define SCAN_QUEUE_SIZE 16
+static ScanReport         s_scanQueue[SCAN_QUEUE_SIZE];
+static volatile uint8_t   s_scanHead = 0;
+static volatile uint8_t   s_scanTail = 0;
+static volatile uint32_t  s_scanDropped = 0;
+void BLEModule::markAdvStopped() { advRunning = false; }
 
 // companyID(2,LE) | 'M' 'e' 't' | ver | type | payload
 static bool parseMetAdv(const uint8_t* data, uint8_t len,
@@ -23,7 +49,11 @@ static bool parseMetAdv(const uint8_t* data, uint8_t len,
         if (adType == BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA && valLen >= 7) {
             if (val[2] == 'M' && val[3] == 'e' && val[4] == 't') {
                 if (type) *type = val[6];
-                uint8_t plen = (uint8_t)(valLen - 6);
+                // Заголовок производителя = 7 байт: company(2) + "Met"(3)
+                // + ver(1) + type(1). Раньше вычиталось 6, из-за чего
+                // payload читался на 1 байт длиннее (хвостовой мусор в
+                // devNo: MET-00001H/R/z).
+                uint8_t plen = (uint8_t)(valLen - 7);
                 if (payload && payloadLen) {
                     if (plen > *payloadLen) plen = *payloadLen;
                     memcpy(payload, &val[7], plen);
@@ -39,10 +69,32 @@ static bool parseMetAdv(const uint8_t* data, uint8_t len,
 
 static void onConnect(uint16_t conn_handle) {
     LOG("BLE connected: handle=%u\n", conn_handle);
+    // Останавливаем скан на время соединения: реклама+скан+линк
+    // одновременно жгут батарею и мешают друг другу.
+    Bluefruit.Scanner.stop();
+    // SoftDevice сам останавливает рекламу при подключении, но наш флаг
+    // остаётся true — тогда buildAdvertising() вызовет stop() повторно и
+    // получит assert. Сбрасываем флаг заранее.
+    BLEModule::markAdvStopped();
 }
 
 static void onDisconnect(uint16_t conn_handle, uint8_t reason) {
     LOG("BLE disconnected: handle=%u reason=0x%02X\n", conn_handle, reason);
+    // Сбрасываем RAM-журнал на диск, пока есть питание.
+    StorageModule::flush();
+    // Сброс сессии: иначе следующий телефон остаётся "владельцем"
+    // (LOG_GET/UNPAIR без повторного AUTH). Также чистит TX-очередь.
+    BLEUartModule::resetSession();
+    // Возобновляем скан только если он реально нужен (провижининг +
+    // валидное время). Иначе оставляем эфир рекламе, чтобы брелок
+    // оставался обнаружимым для --list / повторного провижининга.
+    if (KeystoreModule::provisioned() && KeystoreModule::timeValid()) {
+        Bluefruit.Scanner.start(0);
+    }
+    // Пересобираем рекламу: пока телефон был подключён, TIME_SET мог
+    // сделать время валидным, и брелок должен уйти с pairing beacon на
+    // анонимный ID — иначе пиры его игнорируют (MET_PAYLOAD_ANON).
+    BLEModule::restartAdvertising();
 }
 
 void BLEModule::begin() {
@@ -51,17 +103,30 @@ void BLEModule::begin() {
     Bluefruit.Periph.setConnectCallback(onConnect);
     Bluefruit.Periph.setDisconnectCallback(onDisconnect);
 
-    uint16_t period = (uint16_t)(KeystoreModule::scanPeriodMs() / 0.625f);
-    uint16_t window = (uint16_t)(KeystoreModule::scanWindowMs() / 0.625f);
-    LOG("BLE scan: window=%ums period=%ums (units %u/%u), rssiThr=%d dBm\n",
-        KeystoreModule::scanWindowMs(), KeystoreModule::scanPeriodMs(),
-        window, period, KeystoreModule::rssiThreshold());
-    Bluefruit.Scanner.setRxCallback(scanCallback);
-    Bluefruit.Scanner.restartOnDisconnect(false);
-    Bluefruit.Scanner.setInterval(period, window);
-    Bluefruit.Scanner.useActiveScan(false);
-    Bluefruit.Scanner.start(0);
-    LOGLN("BLE scan started.");
+#if ENABLE_BLE_SCAN
+    // Скан нужен только привязанному брелоку с валидным временем: он ищет
+    // встреченные маячки и пишет журнал. Пока провижининга нет (pairing
+    // beacon), скан только отбирает эфир у рекламы (~90% duty) и мешает ПК
+    // найти брелок — поэтому до провижининга его НЕ запускаем. НО колбэк,
+    // интервал и active-scan настраиваем ВСЕГДА: иначе после TIME_SET скан
+    // стартует (onDisconnect) без rx-callback и не видит ни одного пакета.
+    {
+        uint16_t period = (uint16_t)(KeystoreModule::scanPeriodMs() / 0.625f);
+        uint16_t window = (uint16_t)(KeystoreModule::scanWindowMs() / 0.625f);
+        Bluefruit.Scanner.setRxCallback(scanCallback);
+        Bluefruit.Scanner.restartOnDisconnect(false);
+        Bluefruit.Scanner.setInterval(period, window);
+        Bluefruit.Scanner.useActiveScan(false);
+    }
+    if (KeystoreModule::provisioned() && KeystoreModule::timeValid()) {
+        Bluefruit.Scanner.start(0);
+        LOGLN("BLE scan started.");
+    } else {
+        LOGLN("BLE scan configured, not started (no time yet).");
+    }
+#else
+    LOGLN("BLE scan DISABLED (power test build).");
+#endif
 
     Bluefruit.Advertising.restartOnDisconnect(true);
 
@@ -70,6 +135,12 @@ void BLEModule::begin() {
 }
 
 void BLEModule::loop() {
+    // Разбираем накопленные сканером отчёты (HMAC/журнал/лог) ЗДЕСЬ, в
+    // основном контексте, а не в ISR-колбэке SoftDevice.
+    processScanQueue();
+    // Смену MAC/рекламы на ходу не делаем при активном соединении:
+    // Bluefruit.setAddr() в этом случае рвёт линк. Отложим до отключения.
+    if (Bluefruit.connected()) return;
     if (KeystoreModule::paired() && KeystoreModule::timeValid()) {
         uint32_t epoch = KeystoreModule::utc() / ANON_EPOCH_SECONDS;
         if (epoch != lastEpoch) {
@@ -79,16 +150,49 @@ void BLEModule::loop() {
             restartAdvertising();
         }
     }
+    // Диагностика раз в ~30 с: сколько Met-ADV услышано и записано.
+    static uint32_t s_lastStat = 0;
+    if (millis() - s_lastStat > 30000) {
+        s_lastStat = millis();
+        LOG("SCAN stat: seen=%u recorded=%u enc=%d raw=%u drop=%u scanRun=%u advRun=%u\n",
+            (unsigned)s_advSeen, (unsigned)s_advRecorded, StorageModule::count(),
+            (unsigned)s_rawReports, (unsigned)s_scanDropped,
+            (unsigned)Bluefruit.Scanner.isRunning(),
+            (unsigned)advRunning);
+    }
 }
 
 void BLEModule::rotateMac() {
     uint8_t rnd[6];
     if (!CryptoModule::random(rnd, 6)) return;
-    rnd[5] &= 0x3F;   // non-resolvable private address
+
+    // sd_ble_gap_addr_set() принимает ТОЛЬКО PUBLIC или RANDOM_STATIC
+    // (см. ble_gap.h: sd_ble_gap_addr_set). Тип RANDOM_PRIVATE_NON_RESOLVABLE
+    // (0x03) отвергается с BLE_ERROR_GAP_INVALID_BLE_ADDR (0x3202) — приватный
+    // адрес задаётся через sd_ble_gap_privacy_set, а не set_addr. Поэтому
+    // используем rotating RANDOM_STATIC: старшие два бита старшего байта
+    // (addr[5] = rnd[0], т.к. addr[] в LSB-формате) = 0b11.
+    rnd[0] = (rnd[0] & 0x3F) | 0xC0;
+
+    // SoftDevice запрещает менять identity-адрес, пока активны реклама,
+    // СКАН ИЛИ соединение (sd_ble_gap_addr_set -> NRF_ERROR_INVALID_STATE,
+    // 0x08; см. ble_gap.h). У привязанного брелока с валидным временем
+    // скан постоянно идёт -> одного Advertising.stop() мало. Глушим и скан,
+    // меняем адрес, потом поднимаем всё обратно.
+    bool wasScanning = Bluefruit.Scanner.isRunning();
+    if (advRunning) { Bluefruit.Advertising.stop(); advRunning = false; }
+    if (wasScanning) Bluefruit.Scanner.stop();
+
     ble_gap_addr_t addr;
-    addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_PRIVATE_NON_RESOLVABLE;
+    addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
     for (int i = 0; i < 6; i++) addr.addr[i] = rnd[5 - i];
-    Bluefruit.setAddr(&addr);
+
+    uint32_t st = sd_ble_gap_addr_set(&addr);
+    if (wasScanning) Bluefruit.Scanner.start(0);
+    if (st != NRF_SUCCESS) {
+        LOG("RotateMAC: sd_ble_gap_addr_set failed st=0x%08X\n", (unsigned)st);
+        return;
+    }
     memcpy(currentMac, rnd, 6);
     LOG("Rotated MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
         currentMac[0], currentMac[1], currentMac[2],
@@ -111,8 +215,9 @@ void BLEModule::updateAnonId() {
 }
 
 void BLEModule::buildAdvertising() {
-    Bluefruit.Advertising.stop();
-    advRunning = false;
+    // stop() только если реклама реально запущена: повторный stop при
+    // незапущенной рекламе даёт assert и окна невидимости.
+    if (advRunning) { Bluefruit.Advertising.stop(); advRunning = false; }
     Bluefruit.Advertising.clearData();
     Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
 
@@ -160,37 +265,61 @@ void BLEModule::restartAdvertising() {
     buildAdvertising();
 }
 
+uint32_t BLEModule::advSeen()     { return s_advSeen; }
+uint32_t BLEModule::advRecorded() { return s_advRecorded; }
+
 void BLEModule::scanCallback(ble_gap_evt_adv_report_t* report) {
+    s_rawReports++;
+    // ВАЖНО: этот колбэк работает в контексте прерывания SoftDevice.
+    // Никакого Serial/LOG, никакой криптографии и записи во flash здесь
+    // быть не должно — только разбор рекламы (чистые вычисления) и
+    // копирование в ring-buffer. Вся тяжёлая работа — в processScanQueue().
     uint8_t type = 0;
     uint8_t payload[24];
     uint8_t payloadLen = sizeof(payload);
 
-    if (!parseMetAdv(report->data.p_data, report->data.len,
-                     &type, payload, &payloadLen)) {
-        Bluefruit.Scanner.resume();
-        return;
+    if (parseMetAdv(report->data.p_data, report->data.len,
+                    &type, payload, &payloadLen)) {
+        uint8_t head = s_scanHead;
+        uint8_t next = (uint8_t)((head + 1) % SCAN_QUEUE_SIZE);
+        if (next != s_scanTail) {
+            ScanReport& r = s_scanQueue[head];
+            for (int i = 0; i < 6; i++) r.peerMac[i] = report->peer_addr.addr[5 - i];
+            r.type = type;
+            r.rssi = report->rssi;
+            uint8_t pl = payloadLen;
+            if (pl > sizeof(r.payload)) pl = sizeof(r.payload);
+            memcpy(r.payload, payload, pl);
+            r.payloadLen = pl;
+            __DMB();              // данные записаны до публикации head
+            s_scanHead = next;
+            s_advSeen++;
+        } else {
+            s_scanDropped++;      // очередь переполнена — отчёт теряется
+        }
     }
-
-    int8_t rssi = report->rssi;
-    if (rssi < KeystoreModule::rssiThreshold()) {
-        LOG("Scan: Met rssi=%d < thr=%d, skip\n", rssi, KeystoreModule::rssiThreshold());
-        Bluefruit.Scanner.resume();
-        return;
-    }
-
-    uint8_t mac[6];
-    for (int i = 0; i < 6; i++) mac[i] = report->peer_addr.addr[5 - i];
-    if (memcmp(mac, currentMac, 6) == 0) {
-        LOGLN("Scan: own adv, skip");
-        Bluefruit.Scanner.resume();
-        return;
-    }
-
-    if (type == MET_PAYLOAD_ANON && payloadLen >= 16 && KeystoreModule::timeValid()) {
-        LOG("Scan: anon id rssi=%d, recording\n", rssi);
-        StorageModule::record(KeystoreModule::utc(), payload, rssi);
-    } else if (type == MET_PAYLOAD_PAIR) {
-        LOG("Scan: pair beacon rssi=%d, ignored\n", rssi);
-    }
+    // SoftDevice останавливает скан после каждого отчёта — продолжаем.
     Bluefruit.Scanner.resume();
+}
+
+void BLEModule::processScanQueue() {
+    while (s_scanTail != s_scanHead) {
+        ScanReport r = s_scanQueue[s_scanTail];
+        s_scanTail = (uint8_t)((s_scanTail + 1) % SCAN_QUEUE_SIZE);
+
+        if (r.rssi < KeystoreModule::rssiThreshold()) continue;
+        if (memcmp(r.peerMac, currentMac, 6) == 0) continue;
+
+        if (r.type == MET_PAYLOAD_ANON && r.payloadLen >= 16 &&
+            KeystoreModule::timeValid()) {
+            LOG("Scan: anon id rssi=%d, recording\n", r.rssi);
+            StorageModule::record(KeystoreModule::utc(), r.payload, r.rssi);
+            s_advRecorded++;
+        } else if (r.type == MET_PAYLOAD_PAIR) {
+            char dn[17];
+            uint8_t dl = r.payloadLen; if (dl > 16) dl = 16;
+            memcpy(dn, r.payload, dl); dn[dl] = '\0';
+            LOG("Scan: pair beacon dev=%s rssi=%d, ignored\n", dn, r.rssi);
+        }
+    }
 }

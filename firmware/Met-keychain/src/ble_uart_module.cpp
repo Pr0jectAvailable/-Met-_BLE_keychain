@@ -32,6 +32,23 @@ void BLEUartModule::begin() {
     LOGLN("BLE UART ready.");
 }
 
+void BLEUartModule::resetSession() {
+    s_ownerAuthed = false;
+    s_challengeActive = false;
+    s_authFails = 0;
+    s_lockoutUntil = 0;
+    // Сбрасываем и TX-состояние: незавершённая транзакция предыдущего
+    // соединения не должна блокировать (BUSY) следующий телефон.
+    std::queue<String> empty;
+    std::swap(txQueue, empty);
+    txCurrent = "";
+    txOffset = 0;
+    activeId = 0;
+    txDataLines = 0;
+    txClosing = false;
+    LOGLN("BLE UART: session reset (auth/challenge/TX cleared).");
+}
+
 uint16_t BLEUartModule::currentMtu() {
     BLEConnection* conn = Bluefruit.Connection(0);
     if (conn != nullptr && conn->connected()) {
@@ -175,8 +192,10 @@ static String toHex(const uint8_t* data, size_t len) {
 }
 
 void BLEUartModule::handleLogGet(const String& args) {
-    static Encounter snap[StorageModule::MAX_ENCOUNTERS];
-    int total = StorageModule::snapshot(snap, StorageModule::MAX_ENCOUNTERS);
+    // Перед чтением фиксируем RAM-журнал на диск: склеенные записи не
+    // потеряются, если устройство сбросится сразу после ответа.
+    StorageModule::flush();
+    int total = StorageModule::count();
     if (args.length() == 0) {
         enqueueData(String("LOG total=") + String(total));
         endTransaction();
@@ -195,7 +214,9 @@ void BLEUartModule::handleLogGet(const String& args) {
     enqueueResponse(String(activeId) + " LOG total=" + String(total)
                     + " offset=" + String(offset) + " count=" + String(actual) + "\n");
     for (int i = offset; i < end; i++) {
-        Encounter& e = snap[i];
+        // Читаем запись по индексу без полного копирования журнала в RAM.
+        Encounter e;
+        if (!StorageModule::get(i, e)) break;
         String rec = "ENC seq="; rec += e.seq;
         rec += " id="; rec += toHex(e.id, 16);
         rec += " tf="; rec += e.tFirst;
@@ -582,6 +603,48 @@ void BLEUartModule::processCommand(const String& line) {
         s_ownerAuthed = false;
         BLEModule::restartAdvertising();
         enqueueData(String("RECEIPT ") + toHex(receipt, 32));
+        endTransaction();
+        return;
+    }
+
+    // --- Полная отвязка владельца (по знанию K_dev, как manufacturing-путь) ---
+    // В отличие от UNPAIR (владелец + nonce сервера) этот путь не требует
+    // телефона/K_owner и работает даже если владелец потерян: K_dev есть
+    // только у завода/сервера. Провизьон (devNo/K_dev/K_pair) сохраняется,
+    // стираются только привязка к владельцу, журнал и RAM-часы.
+    if (cmd == "UNBIND_BEGIN") {
+        if (!KeystoreModule::paired()) { errTransaction("NOT_PAIRED", ""); return; }
+        if (!CryptoModule::random(s_challenge, 16)) { errTransaction("RNG", ""); return; }
+        s_challengeActive = true;
+        s_ownerAuthed = false;
+        enqueueData(String("NONCE ") + toHex(s_challenge, 16));
+        endTransaction();
+        return;
+    }
+
+    if (cmd == "UNBIND_FINISH") {
+        if (!KeystoreModule::paired()) { errTransaction("NOT_PAIRED", ""); return; }
+        if (!s_challengeActive) { errTransaction("NO_CHALLENGE", ""); return; }
+        uint8_t sig[32];
+        if (!parseHex(args, sig, 32)) { errTransaction("BAD_ARG", "hmac32"); return; }
+        uint8_t kDev[16]; KeystoreModule::getKDev(kDev);
+        uint8_t mac[32];
+        if (!CryptoModule::hmacSha256(kDev, 16, s_challenge, 16, mac)) {
+            errTransaction("CRYPTO", ""); return;
+        }
+        s_challengeActive = false;
+        if (memcmp(mac, sig, 32) != 0) {
+            LOGLN("UNBIND: proof mismatch");
+            errTransaction("UNBIND_FAIL", ""); return;
+        }
+        LOGLN("UNBIND: authenticated owner unbind");
+        KeystoreModule::unbind();
+        StorageModule::clear();
+        s_ownerAuthed = false;
+        s_authFails = 0;
+        s_lockoutUntil = 0;
+        BLEModule::restartAdvertising();
+        enqueueResponse(String(activeId) + " OK dev=" + KeystoreModule::devNo() + "\n");
         endTransaction();
         return;
     }

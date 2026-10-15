@@ -74,6 +74,7 @@ NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # host -> device (write)
 NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # device -> host (notify)
 
 MET_COMPANY_ID = 0xFFFF
+MET_ADV_TYPE_ANON = 0x01
 MET_ADV_TYPE_PAIR = 0x02
 
 
@@ -94,7 +95,11 @@ class Lines:
 
 
 async def scan_met(timeout: float):
-    """Return {ADDRESS: {devno, rssi, name}} for Met pairing beacons."""
+    """Return {ADDRESS: {kind, devno, anon, rssi, name}} for Met keychains.
+
+    Matches ANY Met advertisement (pairing beacon OR paired anonymous ID) so
+    that --list shows only our keychains, never unrelated BLE devices.
+    """
     from bleak import BleakScanner
 
     found = {}
@@ -103,11 +108,21 @@ async def scan_met(timeout: float):
         md = adv.manufacturer_data.get(MET_COMPANY_ID)
         if not md or len(md) < 5 or md[0:3] != b"Met":
             return
-        if md[4] != MET_ADV_TYPE_PAIR:
+        adv_type = md[4]
+        if adv_type == MET_ADV_TYPE_PAIR:
+            kind = "pair"
+            devno = md[5:].decode("ascii", "replace")
+            anon = ""
+        elif adv_type == MET_ADV_TYPE_ANON and len(md) >= 5 + 16:
+            kind = "anon"
+            devno = ""
+            anon = md[5:21].hex()
+        else:
             return
-        devno = md[5:].decode("ascii", "replace")
         found[device.address.upper()] = {
+            "kind": kind,
             "devno": devno,
+            "anon": anon,
             "rssi": adv.rssi,
             "name": device.name or "",
         }
@@ -280,11 +295,15 @@ async def async_main(args):
     if args.list:
         found = await scan_met(args.scan_time)
         if not found:
-            print("no Met pairing beacons found")
+            print("no Met keychains found")
             return 1
         for addr, info in found.items():
-            print("%-18s devno=%-10s rssi=%s name=%s"
-                  % (addr, info["devno"], info["rssi"], info["name"]))
+            if info["kind"] == "pair":
+                ident = "devno=%-10s" % info["devno"]
+            else:
+                ident = "anon=%s" % info["anon"]
+            print("%-18s %-8s %s rssi=%-4s name=%s"
+                  % (addr, info["kind"], ident, info["rssi"], info["name"]))
         return 0
 
     reset_candidates = []

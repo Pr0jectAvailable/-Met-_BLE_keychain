@@ -31,11 +31,12 @@ public:
     static void flush();
 
     static const int MAX_ENCOUNTERS = 200;
-    static const uint16_t ENC_FORMAT_VERSION = 1;
+    static const uint16_t ENC_FORMAT_VERSION = 2;
 
 private:
     static const uint32_t ENC_MAGIC = 0x4D45544A; // 'METJ'
     static const char* ENC_FILE;
+    static const char* TMP_FILE;
     static Encounter records[MAX_ENCOUNTERS];
     static int recCount;
     static volatile bool dirty;

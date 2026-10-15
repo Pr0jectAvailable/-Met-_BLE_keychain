@@ -15,6 +15,13 @@
 #define UART_MIRROR_TX_PIN 6
 #define UART_MIRROR_RX_PIN 8
 
+// 1 = BLE-скан включён (основной режим), 0 = выключен (тест питания:
+// проверяем, не вызывает ли ~90%% duty-скан ребутов). Переопределяется
+// build-флагом -DENABLE_BLE_SCAN=0 в env:power_test.
+#ifndef ENABLE_BLE_SCAN
+  #define ENABLE_BLE_SCAN 1
+#endif
+
 #if ENABLE_SERIAL
   #define LOG(...)   Serial.printf(__VA_ARGS__)
   #define LOGLN(s)   Serial.println(s)

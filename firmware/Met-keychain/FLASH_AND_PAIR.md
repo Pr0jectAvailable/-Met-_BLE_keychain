@@ -31,7 +31,7 @@ pip install bleak "qrcode[pil]" pyserial
 
 - `bleak` — заливка ключей по BLE (NUS)
 - `qrcode[pil]` — генерация PNG с QR
-- `pyserial` — вход в DFU-загрузчик сбросом 1200 bps
+- `pyserial` — чтение UART-логов ([`scripts/serial_log.py`](scripts/serial_log.py:1))
 
 Внешняя утилита [age](https://github.com/FiloSottile/age) (бинарник `age` /
 `age-keygen`) — генерация ключей и шифрование CSV бэкенда:
@@ -63,6 +63,8 @@ Adafruit. Загрузиться в DFU можно двумя способами
 
 1. **Двойное нажатие кнопки Reset** на плате (быстро два раза). Плата появится
    как USB-устройство загрузчика.
+
+2. Просто зашить (на некоторых платах работает)
 
 ### 1.3. Загрузка прошивки
 
@@ -232,7 +234,7 @@ python flash_keys.py --devno MET-00001 \
 > одноразово залейте recovery-сборку, которая стирает ключи на старте:
 >
 > ```
-> # двойной Reset на плате (или python scripts/erase_touch.py COMx)
+> # плата в DFU (двойной Reset), затем:
 > pio run -e recovery -t upload --upload-port COMx
 > pio run -t upload --upload-port COMx   # вернуть обычную прошивку
 > ```
@@ -240,6 +242,92 @@ python flash_keys.py --devno MET-00001 \
 > После этого брелок снова pairing beacon — повторите команду без `--reset`
 > (или с `--reset`, теперь сработает обычный `FACTORY_RESET`). Полное стирание
 > чипа через `--eraseall` требует SWD-проба.
+
+### 2.6. Отвязка по последовательному порту (демо, без скриптов)
+
+Для демонстрации отвязку можно сделать вообще без ПК-скриптов: прошивка
+принимает команды прямо из последовательного порта (USB CDC и UART-зеркало,
+115200). Команды **без аутентификации** — это демо-режим.
+
+Подключитесь к порту (`pio device monitor -b 115200`) и введите строку:
+
+```
+UNBIND
+```
+
+Брелок снимает привязку к владельцу (`K_owner`, флаг `paired`), стирает журнал
+встреч и RAM-часы, но **сохраняет провизьон** (`devNo`/`K_dev`/`K_pair`) и `seq`
+— его можно привязать заново тем же `K_pair`. В лог выводится
+`SERIAL CMD: owner unbound (provision kept)`.
+
+```
+FACTORY_RESET
+```
+
+Дополнительно стирает и провизьон (как `--reset` в `flash_keys.py`) — брелок
+снова чистый pairing beacon.
+
+```
+HELP
+```
+
+Печатает список доступных serial-команд.
+
+Реализация — [`handleSerialLine()`](src/main.cpp:34), опрос порта —
+[`pollSerialCommand()`](src/main.cpp:66). Команды обрабатываются в `loop()`
+и работают, пока в [`headers/config.h`](headers/config.h:8) включены
+`ENABLE_SERIAL` и/или `ENABLE_UART_MIRROR`.
+
+### 2.7. Полная отвязка владельца без владельца (`unbind.py`)
+
+Скрипт [`tools/unbind.py`](tools/unbind.py:1) снимает привязку к владельцу
+(`K_owner`, флаг `paired`), стирает журнал встреч и RAM-часы, но **сохраняет
+провизьон** (`devNo`/`K_dev`/`K_pair`) и монотонный `seq`. Брелок возвращается
+в режим pairing beacon и его можно привязать заново тем же `K_pair`.
+
+В отличие от `UNPAIR` (раздел 5), этот путь **не требует владельца** и nonce
+сервера: он доказывает знание `K_dev` (заводской/серверный секрет, по BLE не
+передаётся) через `UNBIND_BEGIN` / `UNBIND_FINISH` — тем же примитивом, что и
+`FACTORY_RESET_FINISH` (см. [`PROTOCOL.md`](PROTOCOL.md:58)). Пригодится, когда
+ключ владельца потерян, а провизьон нужно сохранить.
+
+1. Посмотрите список найденных брелоков (видны и pairing `type=0x02`, и
+   анонимные `type=0x01` beacon'ы):
+
+```
+cd firmware/Met-keychain/tools
+python unbind.py --list
+```
+
+Вывод: `ADDRESS pair|anon devno=... rssi=... name=...`.
+
+2. Отвяжите, указав `K_dev` брелока (hex32) и адрес:
+
+```
+python unbind.py --kdev 00112233445566778899aabbccddeeff \
+    --address AA:BB:CC:DD:EE:FF
+```
+
+`--address` можно не указывать, если в эфире ровно один брелок — скрипт выберет
+его сам (иначе требует явный адрес).
+
+3. Либо возьмите `K_dev` прямо из зашифрованного CSV (расшифровка в памяти, на
+   диск не пишется):
+
+```
+python unbind.py --csv-age ./batch/backend_keys.csv.age --row 3 \
+    --age-key ./keys/age_private.key --address AA:BB:CC:DD:EE:FF
+```
+
+Также можно указать строку из открытого CSV: `--csv ./plain.csv --row 3`.
+
+При успехе скрипт печатает `UNBIND_FINISH -> OK dev=MET-00001` и
+`OK owner unbound (provision kept)`. Если пришло `ERR UNBIND_FAIL` — передан не
+тот `K_dev` (не совпадает с текущим на устройстве).
+
+> Чтобы стереть вместе с привязкой и провизьон (`devNo`/`K_dev`/`K_pair`),
+> используйте `--reset` в [`tools/flash_keys.py`](tools/flash_keys.py:1)
+> (`FACTORY_RESET`/`FACTORY_RESET_BEGIN`/`FACTORY_RESET_FINISH`).
 
 ---
 
@@ -388,8 +476,8 @@ fw=... dev=MET-00001 paired=false timeok=false mtu=...`.
 
 | Симптом | Причина / решение |
 |---------|-------------------|
-| `pio run -t upload` не находит порт | Плата не в DFU. Двойной Reset или `python scripts/erase_touch.py COMx`, затем `--upload-port`. |
-| `There is no debugger connected to the PC` | Цель `erase` по умолчанию ждёт SWD. Используйте `erase_touch.py` (переопределено в [`scripts/erase_override.py`](scripts/erase_override.py:1)). |
+| `pio run -t upload` не находит порт | Плата не в DFU. Двойной Reset, затем `--upload-port COMx`. Платы прошиваются без дополнительных скриптов. |
+| `There is no debugger connected to the PC` | Цель `erase` в PlatformIO ждёт SWD-проб. Плату не нужно стирать для прошивки — просто `pio run -t upload` в DFU. Полное стирание чипа — только через SWD (`--eraseall`). |
 | `flash_keys.py --list` ничего не находит | Брелок привязан (рекламируется молча или как `type=0x01`) либо далеко. Для перепровижининга нужен непривязанный брелок или `--reset`. |
 | `ERR BUSY` в логе | Одновременно идёт другая транзакция — протокол однопоточный (см. [`PROTOCOL.md`](PROTOCOL.md:14)). |
 | `ERR AUTH_FAIL` | Неверный `K_owner`. При 3 ошибках подряд — пауза 30 с (см. [`headers/config.h`](headers/config.h:56)). |

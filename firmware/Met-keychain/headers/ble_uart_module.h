@@ -15,6 +15,11 @@ public:
     static void begin();
     static void loop();
 
+    // Сброс состояния сессии при разрыве BLE-соединения: снимает
+    // s_ownerAuthed/s_challengeActive, чтобы следующий подключившийся
+    // телефон не считался владельцем. Вызывается из onDisconnect().
+    static void resetSession();
+
 private:
     static BLEUart bleuart;
     static void rxCallback(uint16_t conn_handle);

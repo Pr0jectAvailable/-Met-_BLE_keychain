@@ -393,13 +393,18 @@ class MetClient {
     final char = _rx;
     if (char == null) throw StateError('Нет характеристики записи');
     final data = utf8.encode('$line\n');
-    if (data.length > maxChunkSize) {
-      throw Exception(
-          'Команда длиннее MTU−3: ${data.length} > $maxChunkSize (MTU=$_mtu)');
+    // Длинную строку отправляем несколькими write-порциями: прошивка собирает
+    // строку из RX-порций до '\n' (ble_uart_module.cpp rxCallback). Раньше
+    // строка > MTU−3 бросала исключение — из-за этого PAIR_FINISH (~124 байта)
+    // не работал при MTU=23.
+    for (var off = 0; off < data.length; off += maxChunkSize) {
+      final end = (off + maxChunkSize < data.length)
+          ? off + maxChunkSize
+          : data.length;
+      // write with response: без подтверждения BLE-стек может молча потерять
+      // порцию сразу после подключения — отсюда таймауты и нестабильность.
+      await char.write(data.sublist(off, end), withoutResponse: false);
     }
-    // write with response: без подтверждения BLE-стек может молча потерять
-    // команду сразу после подключения — отсюда таймауты и нестабильность.
-    await char.write(data, withoutResponse: false);
   }
 
   // ---------- Команды ----------
@@ -486,11 +491,13 @@ class MetClient {
   }
 
   /// LOG_ACK: подтверждение приёма до seq (телефон шлёт после OK сервера).
+  /// Прошивка отвечает `ACKED <removed>` (не `removed=`).
   Future<int> logAck(int seq) async {
     final lines = await transact('LOG_ACK $seq');
     for (final l in lines) {
       if (l.startsWith('ACKED')) {
-        return int.tryParse(_kv(l, 'removed') ?? '') ?? 0;
+        final p = l.split(RegExp(r'\s+'));
+        if (p.length >= 2) return int.tryParse(p[1]) ?? 0;
       }
     }
     return 0;
@@ -554,19 +561,29 @@ class MetClient {
     throw Exception('Не получен RECEIPT');
   }
 
-  /// Формат строки ENC: seq id tFirst tLast rssi count tag
+  /// Формат строки ENC от прошивки (key=value):
+  /// `seq=<seq> id=<hex> tf=<tFirst> tl=<tLast> rssi=<rssi> cnt=<count> tag=<hex>`
   JournalRecord? _parseEnc(String s) {
-    final p = s.split(RegExp(r'\s+'));
-    if (p.length < 7) return null;
+    final seq = int.tryParse(_kv(s, 'seq') ?? '');
+    final idHex = _kv(s, 'id');
+    final tf = int.tryParse(_kv(s, 'tf') ?? '');
+    final tl = int.tryParse(_kv(s, 'tl') ?? '');
+    final rssi = int.tryParse(_kv(s, 'rssi') ?? '');
+    final cnt = int.tryParse(_kv(s, 'cnt') ?? '');
+    final tagHex = _kv(s, 'tag');
+    if (seq == null || idHex == null || tf == null || tl == null ||
+        rssi == null || cnt == null || tagHex == null) {
+      return null;
+    }
     try {
       return JournalRecord(
-        seq: int.parse(p[0]),
-        id: fromHex(p[1]),
-        tFirst: int.parse(p[2]),
-        tLast: int.parse(p[3]),
-        rssi: int.parse(p[4]),
-        count: int.parse(p[5]),
-        tag: fromHex(p[6]),
+        seq: seq,
+        id: fromHex(idHex),
+        tFirst: tf,
+        tLast: tl,
+        rssi: rssi,
+        count: cnt,
+        tag: fromHex(tagHex),
       );
     } catch (_) {
       return null;
