@@ -177,11 +177,14 @@ void BLEModule::loop() {
     // (uptime мал после сброса) без ожидания BOOT-блока.
     static uint32_t s_lastBeat = 0;
     if (millis() - s_lastBeat > 5000) {
+        // DIAG: реальный интервал от прошлого удара. Нецелые/дрейфующие
+        // значения показывают задержку loop(), а не сброс (uptime монотонен).
+        uint32_t beatDt = millis() - s_lastBeat;
         s_lastBeat = millis();
         // DIAG: heap free/total + a stack sentinel via local address. A steadily
         // falling free heap before the reset points to a leak (Strings/queue).
-        LOG("HB up=%lus conn=%u scanRun=%u advRun=%u heap=%u/%u\n",
-            (unsigned long)(millis() / 1000),
+        LOG("HB up=%lus dt=%ums conn=%u scanRun=%u advRun=%u heap=%u/%u\n",
+            (unsigned long)(millis() / 1000), (unsigned)beatDt,
             (unsigned)Bluefruit.connected(),
             (unsigned)Bluefruit.Scanner.isRunning(), (unsigned)advRunning,
             (unsigned)dbgHeapFree(), (unsigned)dbgHeapTotal());
