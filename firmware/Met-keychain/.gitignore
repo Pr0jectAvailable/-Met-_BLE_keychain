@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Provisioning secrets — never commit
+keys/
+tools/batch/
+*.key
+!*.pub.key
+*.csv
+*.csv.age

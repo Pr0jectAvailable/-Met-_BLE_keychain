@@ -3,17 +3,23 @@
 
 #include <bluefruit.h>
 
+// Реклама и сканирование брелока (см. task.txt «Реклама», «Сканирование»).
 class BLEModule {
 public:
     static void begin();
-    static void setDeviceName(const char* name);
-    static void setMacAddress(const uint8_t mac[6]);
+    static void loop();
+    static void restartAdvertising();
 
 private:
     static void scanCallback(ble_gap_evt_adv_report_t* report);
-    // 16-бит UUID (0x0201) вместо 128-бит: экономит 16 байт в ADV-пакете.
-    // ВАЖНО: фильтр сканера и внешние сканеры должны использовать этот же UUID.
-    static uint16_t baseUuid16;
+    static void buildAdvertising();
+    static void rotateMac();
+    static void updateAnonId();
+
+    static uint8_t  currentMac[6];
+    static uint8_t  anonId[16];
+    static uint32_t lastEpoch;
+    static bool     advRunning;
 };
 
 #endif

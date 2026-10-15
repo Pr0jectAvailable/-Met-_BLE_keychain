@@ -1,119 +1,83 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 
-// Nordic UART Service — UUID, которые использует BLEUart из Adafruit
-const String kServiceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-const String kRxCharUuid = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // write
-const String kTxCharUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // notify
+import 'package:mobile_scanner/mobile_scanner.dart';
 
-/// Максимальная длина строки протокола в байтах (protocol_ble.txt: MAX_LINE).
-const int kMaxLine = 200;
+import 'met_client.dart';
+import 'met_crypto.dart';
 
-/// Размер страницы журнала (не зависит от MTU, protocol_ble.txt: п.5).
-const int kDevicesPage = 10;
+void main() => runApp(const MetApp());
 
-/// Таймаут ожидания терминатора END/ERR (protocol_ble.txt: 2 с).
-const Duration kTxnTimeout = Duration(seconds: 2);
-
-/// 16-бит UUID вещания ключа (прошивка: baseUuid16 = 0x0201).
-/// В эфире передаётся little-endian (0x01, 0x02), но flutter_blue_plus
-/// нормализует 16-бит UUID до полной 128-бит формы BLE base UUID.
-const int kBaseUuid16 = 0x0201;
-const String kBaseUuid16Full = "00000201-0000-1000-8000-00805F9B34FB";
-
-/// Одна запись журнала.
-///
-/// Новый протокол передаёт компактный JSON с короткими ключами
-/// (m — MAC, r — RSSI, t — время, n — имя). Для совместимости со старыми
-/// прошивками поддерживаются и длинные ключи (mac/rssi/time/name).
-class DeviceRecord {
-  final String mac;
-  final int rssi;
-  final int time;
-  final String name;
-
-  const DeviceRecord({
-    required this.mac,
-    required this.rssi,
-    required this.time,
-    required this.name,
-  });
-
-  factory DeviceRecord.fromJson(Map<String, dynamic> j) {
-    return DeviceRecord(
-      mac: (j['m'] ?? j['mac'] ?? '').toString(),
-      rssi: _asInt(j['r'] ?? j['rssi']),
-      time: _asInt(j['t'] ?? j['time']),
-      name: (j['n'] ?? j['name'] ?? '').toString(),
-    );
-  }
-
-  Map<String, dynamic> toJson() => {
-        'm': mac,
-        'r': rssi,
-        't': time,
-        if (name.isNotEmpty) 'n': name,
-      };
-
-  DeviceRecord copyWith({String? name}) => DeviceRecord(
-        mac: mac,
-        rssi: rssi,
-        time: time,
-        name: name ?? this.name,
-      );
-
-  static int _asInt(dynamic v) {
-    if (v is int) return v;
-    if (v is num) return v.toInt();
-    return int.tryParse(v?.toString() ?? '') ?? 0;
-  }
-}
-
-/// Ошибка уровня протокола: терминатор `<id> ERR <код> [текст]`.
-class ProtoException implements Exception {
-  final String code;
-  final String text;
-  ProtoException(this.code, this.text);
-
-  @override
-  String toString() => 'ERR $code${text.isEmpty ? '' : ' $text'}';
-}
-
-/// Итог одной транзакции.
-class _TxnOutcome {
-  final List<String> data; // строки без <id>: "<TOKEN> [данные]"
-  final int? expectedCount; // из END n=<N>
-  final String? error; // строка ERR без id
-
-  _TxnOutcome({required this.data, this.expectedCount, this.error});
-}
-
-/// Активная транзакция: id и сборщик строк.
-class _ActiveTxn {
-  final int id;
-  final Completer<_TxnOutcome> completer = Completer<_TxnOutcome>();
-  final List<String> data = [];
-  _ActiveTxn(this.id);
-}
-
-void main() => runApp(const MyApp());
-
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class MetApp extends StatelessWidget {
+  const MetApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BLE Tracker',
-      theme: ThemeData(primarySwatch: Colors.blue),
+      title: 'Met Keychain',
+      theme: ThemeData(primarySwatch: Colors.indigo),
       home: const HomePage(),
+    );
+  }
+}
+
+class MetPairUri {
+  final String devNo;
+  final String kPairB32;
+  const MetPairUri({required this.devNo, required this.kPairB32});
+}
+
+MetPairUri? parsePairUri(String raw) {
+  try {
+    final u = Uri.parse(raw.trim());
+    if (u.scheme != 'met' || u.host != 'pair') return null;
+    final d = u.queryParameters['d'];
+    final k = u.queryParameters['k'];
+    if (d == null || k == null || d.isEmpty || k.isEmpty) return null;
+    return MetPairUri(devNo: d, kPairB32: k);
+  } catch (_) {
+    return null;
+  }
+}
+
+class QrScanPage extends StatefulWidget {
+  const QrScanPage({super.key});
+  @override
+  State<QrScanPage> createState() => _QrScanPageState();
+}
+
+class _QrScanPageState extends State<QrScanPage> {
+  final MobileScannerController _controller = MobileScannerController();
+  bool _handled = false;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_handled) return;
+    for (final b in capture.barcodes) {
+      final v = b.rawValue;
+      if (v != null && v.startsWith('met://')) {
+        _handled = true;
+        Navigator.of(context).pop(v);
+        return;
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Сканирование QR')),
+      body: MobileScanner(controller: _controller, onDetect: _onDetect),
     );
   }
 }
@@ -126,98 +90,95 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  // ---------- Состояние подключения ----------
-  BluetoothDevice? _device;
-  BluetoothCharacteristic? _rxChar;
-  BluetoothCharacteristic? _txChar;
+  // ---------- Сканирование ----------
   StreamSubscription? _scanSub;
-  StreamSubscription? _dataSub;
-  StreamSubscription? _connSub;
-
   bool _isScanning = false;
-  bool _isConnected = false;
-  bool _isConnecting = false;
   List<ScanResult> _scanResults = [];
-  bool _onlyKeychain = false; // фильтр по 16-бит UUID ключа (0x0201)
-  // Порог RSSI (dBm): показывать только устройства с сигналом не слабее.
-  // -100 = без отсечения, -40 = только очень близкие.
+  bool _onlyMet = false;
   int _rssiThreshold = -100;
 
-  // ---------- Приём ----------
-  // Буфер байт до '\n'. Ограничен kMaxLine; переполнение сбрасывает буфер.
-  final List<int> _rxBytes = [];
+  // ---------- Подключение ----------
+  MetClient? _client;
+  BluetoothDevice? _device;
+  bool _isConnecting = false;
 
-  // ---------- Транзакции ----------
-  int _txId = 0;
-  _ActiveTxn? _active;
-  Future<void> _txnChain = Future.value();
-
-  // Данные, полученные от MCU
-  String _mcuName = "";
-  String _mcuMac = "";
-  String _proto = "";
-  String _fw = "";
-  int _mcuMtu = 0;
+  // ---------- Сессия ----------
+  bool _authed = false;
+  String? _kOwnerHex;
+  String? _deviceNumber;
+  Uint8List? _kDev; // только если пользователь ввёл вручную (демо/тест)
 
   // ---------- Журнал ----------
-  List<DeviceRecord> _deviceRecords = [];
-  int _devicesTotal = 0;
-  bool _isFetchingDevices = false;
+  List<JournalRecord> _records = [];
+  int _journalTotal = 0;
+  bool _fetching = false;
 
-  // ---------- Логи BLE ----------
-  final List<String> _bleLogs = [];
-  static const int _maxBleLogs = 500;
-  final ScrollController _bleLogsScroll = ScrollController();
-  bool _bleLogsAutoScroll = true;
+  // ---------- Логи ----------
+  final List<String> _logs = [];
+  static const int _maxLogs = 500;
+  final ScrollController _logsScroll = ScrollController();
+  bool _autoScroll = true;
 
-  // MTU по умолчанию (BLE 4.0) и фактический после согласования
-  int _mtu = 23;
-  int get _maxChunkSize => _mtu - 3; // 3 байта ATT-заголовка
+  final _devNoCtrl = TextEditingController();
+  final _kPairCtrl = TextEditingController();
+  final _kOwnerCtrl = TextEditingController();
+  final _kDevCtrl = TextEditingController();
+  final _nonceCtrl = TextEditingController();
+  final _timeSigCtrl = TextEditingController();
+  final _batteryCtrl = TextEditingController();
 
-  final TextEditingController _nameController = TextEditingController();
-  final TextEditingController _macController = TextEditingController();
-
-  // ---------- Lifecycle ----------
   @override
   void initState() {
     super.initState();
     _requestPermissions();
+    _loadCreds();
   }
 
   @override
   void dispose() {
     _scanSub?.cancel();
-    _dataSub?.cancel();
-    _connSub?.cancel();
-    _device?.disconnect();
-    _nameController.dispose();
-    _macController.dispose();
-    _bleLogsScroll.dispose();
+    _client?.disconnect();
+    _logsScroll.dispose();
+    _devNoCtrl.dispose();
+    _kPairCtrl.dispose();
+    _kOwnerCtrl.dispose();
+    _kDevCtrl.dispose();
+    _nonceCtrl.dispose();
+    _timeSigCtrl.dispose();
+    _batteryCtrl.dispose();
     super.dispose();
   }
 
-  // ---------- Логирование BLE ----------
-  void _addBleLog(String direction, String message) {
+  // ---------- Утилиты ----------
+  void _addLog(String dir, String msg) {
     if (!mounted) return;
     final now = DateTime.now();
-    final ts = "${_two(now.hour)}:${_two(now.minute)}:${_two(now.second)}"
-        ".${now.millisecond.toString().padLeft(3, '0')}";
+    final ts = '${_two(now.hour)}:${_two(now.minute)}:${_two(now.second)}'
+        '.${now.millisecond.toString().padLeft(3, '0')}';
     setState(() {
-      _bleLogs.add("$ts  $direction  $message");
-      if (_bleLogs.length > _maxBleLogs) {
-        _bleLogs.removeRange(0, _bleLogs.length - _maxBleLogs);
+      _logs.add('$ts  $dir  $msg');
+      if (_logs.length > _maxLogs) {
+        _logs.removeRange(0, _logs.length - _maxLogs);
       }
     });
-    if (_bleLogsAutoScroll) {
+    if (_autoScroll) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_bleLogsScroll.hasClients) {
-          _bleLogsScroll.jumpTo(_bleLogsScroll.position.maxScrollExtent);
+        if (_logsScroll.hasClients) {
+          _logsScroll.jumpTo(_logsScroll.position.maxScrollExtent);
         }
       });
     }
   }
 
-  // ---------- Разрешения ----------
+  String _two(int n) => n.toString().padLeft(2, '0');
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
+    );
+  }
+
   Future<void> _requestPermissions() async {
     await [
       Permission.bluetoothScan,
@@ -226,684 +187,440 @@ class _HomePageState extends State<HomePage> {
     ].request();
   }
 
+  Future<void> _loadCreds() async {
+    final owner = await MetCredentials.kOwnerHex;
+    final dev = await MetCredentials.deviceNumber;
+    final pair = await MetCredentials.kPairHex;
+    if (!mounted) return;
+    setState(() {
+      _kOwnerHex = owner;
+      _deviceNumber = dev;
+      if (owner != null) _kOwnerCtrl.text = owner;
+      if (dev != null) _devNoCtrl.text = dev;
+      if (pair != null) _kPairCtrl.text = pair;
+    });
+  }
+
   // ---------- Сканирование ----------
   Future<void> _startScan() async {
     setState(() {
       _scanResults = [];
       _isScanning = true;
     });
-
     if (await FlutterBluePlus.adapterState.first !=
         BluetoothAdapterState.on) {
-      _showSnack("Включите Bluetooth");
+      _snack('Включите Bluetooth');
       setState(() => _isScanning = false);
       return;
     }
-
-    if (!(await FlutterBluePlus.isSupported)) {
-      _showSnack("BLE не поддерживается устройством");
-      setState(() => _isScanning = false);
-      return;
-    }
-
     await _scanSub?.cancel();
     await FlutterBluePlus.stopScan();
-
-    _scanSub = FlutterBluePlus.scanResults.listen((results) {
+    while (FlutterBluePlus.isScanningNow) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    _scanSub = FlutterBluePlus.scanResults.listen((r) {
       if (!mounted) return;
-      _syncNamesFromAdvertisements(results);
-      setState(() => _scanResults = results);
+      setState(() => _scanResults = r);
     });
-
     try {
-      // flutter_blue_plus всегда сканирует активно: на Android это
-      // SCAN_MODE_* + запрос SCAN_RSP, на iOS — scanForPeripherals.
-      // Поэтому имя из scan response (ScanResponse.addName()) попадёт в
-      // advName ниже. continuousUpdates нужен, чтобы поймать scan response,
-      // пришедший отдельным пакетом уже после основного ADV.
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 15),
         androidScanMode: AndroidScanMode.lowLatency,
         continuousUpdates: true,
       );
     } catch (e) {
-      _showSnack("Ошибка сканирования: $e");
-      if (mounted) setState(() => _isScanning = false);
-      return;
+      _snack('Ошибка сканирования: $e');
     }
-
     if (mounted) setState(() => _isScanning = false);
   }
 
-  /// Проверяет, вещает ли устройство 16-бит UUID ключа (baseUuid16 = 0x0201).
-  /// FBP может отдать UUID как в короткой 16-бит форме («0201»), так и в
-  /// полной 128-бит base-форме, поэтому сравниваем нормализованный hex.
-  bool _isKeychain(AdvertisementData adv) {
-    for (final g in adv.serviceUuids) {
-      final s = g.toString().toUpperCase().replaceAll(RegExp(r'[^0-9A-F]'), '');
-      if (s == '0201') return true; // короткая 16-бит форма
-      if (s.startsWith('00000201')) return true; // полная 128-бит base-форма
-    }
-    return false;
+  MetAdvertisement? _metAdv(ScanResult r) {
+    final mf = r.advertisementData.manufacturerData;
+    if (mf.isEmpty) return null;
+    return parseMetAdvertisement(mf);
   }
 
-  /// Приводит MAC к верхнему регистру без разделителей для сравнения.
-  String _normMac(String s) =>
-      s.toUpperCase().replaceAll(RegExp(r'[^0-9A-F]'), '');
-
-  /// Обновляет имена известных устройств по свежим ADV.
-  ///
-  /// Если в журнале уже есть запись с таким же MAC, а в эфире пришло
-  /// непустое имя (advName из ADV/scan response или platformName) —
-  /// заменяем имя в записи, чтобы список показывал актуальное значение.
-  void _syncNamesFromAdvertisements(List<ScanResult> results) {
-    if (_deviceRecords.isEmpty) return;
-
-    // MAC -> самое свежее непустое имя из эфира.
-    final byMac = <String, String>{};
-    for (final r in results) {
-      final advName = r.advertisementData.advName;
-      final name = advName.isNotEmpty ? advName : r.device.platformName;
-      if (name.isEmpty) continue;
-      byMac[_normMac(r.device.remoteId.toString())] = name;
-    }
-    if (byMac.isEmpty) return;
-
-    bool changed = false;
-    final updated = <DeviceRecord>[];
-    for (final rec in _deviceRecords) {
-      final fresh = byMac[_normMac(rec.mac)];
-      if (fresh != null && fresh != rec.name) {
-        updated.add(rec.copyWith(name: fresh));
-        changed = true;
-      } else {
-        updated.add(rec);
-      }
-    }
-    if (changed) _deviceRecords = updated;
-  }
-
-  /// Результаты сканирования с учётом фильтров «только ключи» и порога RSSI.
-  /// Отсортированы по убыванию RSSI: сильные сигналы (близкие устройства)
-  /// идут первыми.
-  List<ScanResult> get _visibleScanResults {
+  List<ScanResult> get _visible {
     var list = _scanResults.where((r) => r.rssi >= _rssiThreshold);
-    if (_onlyKeychain) {
-      list = list.where((r) => _isKeychain(r.advertisementData));
-    }
+    if (_onlyMet) list = list.where((r) => _metAdv(r) != null);
     return list.toList()..sort((a, b) => b.rssi.compareTo(a.rssi));
   }
 
-  /// Согласование MTU с повтором и проверкой.
-  ///
-  /// Android: requestMtu шлёт ATT_EXCHANGE_MTU_REQ, FBP ждёт onMtuChanged
-  /// и возвращает согласованное значение. iOS: requestMtu — no-op, MTU
-  /// поднимается стеком сам, поэтому читаем device.mtuNow (FBP обновляет его
-  /// из maximumWriteValueLength). Возвращает реальный MTU, не меньше 23.
-  Future<int> _negotiateMtu(BluetoothDevice device) async {
-    const int target = 247; // PROTO_MTU_REPORT на MCU
-    for (int i = 0; i < 3; i++) {
-      try {
-        final int m = await device.requestMtu(target);
-        if (m > 23) {
-          debugPrint("MTU согласован: $m (попытка ${i + 1})");
-          return m;
-        }
-      } catch (e) {
-        debugPrint("requestMtu не удался (попытка ${i + 1}): $e");
-      }
-      // Даём стеку время применить/сообщить новый MTU (особенно iOS).
-      await Future.delayed(const Duration(milliseconds: 300));
-      final int cur = device.mtuNow;
-      if (cur > 23) {
-        debugPrint("MTU из стека: $cur");
-        return cur;
-      }
+  // ---------- QR-подключение ----------
+  Future<void> _scanQr() async {
+    final data = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const QrScanPage()),
+    );
+    if (data == null) return;
+    final parsed = parsePairUri(data);
+    if (parsed == null) {
+      _snack('Неверный QR: $data');
+      return;
     }
-    final int fallback = device.mtuNow;
-    debugPrint("MTU остался $fallback (согласование не удалось)");
-    return fallback > 23 ? fallback : 23;
+    setState(() {
+      _devNoCtrl.text = parsed.devNo;
+      _kPairCtrl.text = parsed.kPairB32;
+    });
+    await MetCredentials.saveKPair(parsed.kPairB32);
+    _snack('QR: ${parsed.devNo}. Подключаюсь...');
+    await _connectByDeviceNumber(parsed.devNo);
   }
 
-  // ---------- Подключение с retry ----------
-  Future<void> _connect(BluetoothDevice device) async {
+  /// Ищет в эфире брелок с номером из QR и подключается к нему.
+  Future<void> _connectByDeviceNumber(String devNo) async {
     if (_isConnecting) return;
-    _isConnecting = true;
-    if (mounted) setState(() => _isConnecting = true);
-
-    const maxAttempts = 3;
-    try {
-      for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          await FlutterBluePlus.stopScan();
-          await _scanSub?.cancel();
-          _scanSub = null;
-
-          if (device.isConnected) {
-            await device.disconnect();
-            await Future.delayed(const Duration(milliseconds: 250));
-          }
-
-          await device.connect(
-            timeout: const Duration(seconds: 20),
-            autoConnect: false,
-          );
-
-          await Future.delayed(const Duration(milliseconds: 150));
-
-          // ---- Согласование MTU (обязательно, ДО HELLO) ----
-          // MCU в HELLO сообщает mtu=247 (PROTO_MTU_REPORT) и режет строки
-          // по currentMtu()−3. Телефон обязан согласовать MTU до первой
-          // команды, иначе строки длиннее 20 байт (напр. SET_NAME) падают
-          // ещё в _writeLine(). _negotiateMtu() делает повтор и проверку.
-          _mtu = await _negotiateMtu(device);
-          debugPrint("Рабочий MTU: $_mtu (payload ${_mtu - 3})");
-
-          _device = device;
-          if (mounted) setState(() => _mcuMac = "");
-
-          await _connSub?.cancel();
-          _connSub = device.connectionState.listen((state) {
-            if (state == BluetoothConnectionState.disconnected) {
-              if (mounted) {
-                setState(() {
-                  _isConnected = false;
-                  _device = null;
-                  _rxChar = null;
-                  _txChar = null;
-                });
-                _showSnack("Соединение потеряно");
-              }
-            }
-          });
-
-          final services = await device.discoverServices();
-
-          BluetoothCharacteristic? rx;
-          BluetoothCharacteristic? tx;
-          for (final s in services) {
-            if (s.uuid.toString().toUpperCase() == kServiceUuid) {
-              for (final c in s.characteristics) {
-                final u = c.uuid.toString().toUpperCase();
-                if (u == kRxCharUuid) rx = c;
-                if (u == kTxCharUuid) tx = c;
-              }
-            }
-          }
-
-          if (rx == null || tx == null) {
-            throw Exception("NUS-характеристики не найдены");
-          }
-
-          _rxChar = rx;
-          _txChar = tx;
-
-          await _dataSub?.cancel();
-          _rxBytes.clear();
-          _dataSub = tx.onValueReceived.listen(_onDataReceived);
-          await tx.setNotifyValue(true);
-
-          if (mounted) {
-            setState(() {
-              _isConnected = true;
-              _isConnecting = false;
-            });
-          }
-
-          // ---- HELLO (handshake, proto=2) ----
-          await _hello();
-
-          break; // успех
-        } catch (e) {
-          debugPrint("Попытка $attempt не удалась: $e");
-          if (attempt == maxAttempts) {
-            _showSnack("Не удалось подключиться: $e");
-            if (mounted) setState(() => _isConnecting = false);
-            return;
-          }
-          await Future.delayed(const Duration(milliseconds: 700));
+    // До 3 циклов «скан → подключение»: на Android первый скан сразу после
+    // предыдущего часто не даёт ни одного пакета, а первый connect рвётся
+    // на GATT. Раньше это требовало 3 ручных нажатий — теперь повторяем сами.
+    const maxCycles = 3;
+    for (var cycle = 0; cycle < maxCycles; cycle++) {
+      if (!mounted) return;
+      final found = await _scanForDevice(devNo);
+      if (found != null) {
+        final ok = await _connect(found);
+        if (ok) {
+          if (mounted) setState(() => _isScanning = false);
+          return;
         }
       }
+      // Перед повтором даём стеку BLE полностью освободить устройство.
+      await Future.delayed(const Duration(milliseconds: 800));
+    }
+    if (mounted) {
+      setState(() => _isScanning = false);
+      _snack('Устройство $devNo не найдено');
+    }
+  }
+
+  /// Один проход сканирования. Возвращает найденное устройство или null.
+  /// Выходит сразу после находки, не дожидаясь таймаута скана.
+  Future<BluetoothDevice?> _scanForDevice(String devNo) async {
+    await _scanSub?.cancel();
+    await FlutterBluePlus.stopScan();
+    while (FlutterBluePlus.isScanningNow) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    if (await FlutterBluePlus.adapterState.first !=
+        BluetoothAdapterState.on) {
+      _snack('Включите Bluetooth');
+      return null;
+    }
+    setState(() {
+      _scanResults = [];
+      _isScanning = true;
+    });
+    BluetoothDevice? target;
+    // Fallback: после привязки брелок рекламируется как anonymous (без devNo),
+    // поэтому точного совпадения по номеру может не быть. Запоминаем любое
+    // Met-устройство на случай, если по devNo за весь скан так и не нашли.
+    BluetoothDevice? fallback;
+    final completer = Completer<BluetoothDevice?>();
+    _scanSub = FlutterBluePlus.scanResults.listen((r) {
+      if (!mounted) return;
+      setState(() => _scanResults = r);
+      if (target != null) return;
+      for (final res in r) {
+        final adv = _metAdv(res);
+        if (adv == null) continue;
+        if (adv.kind == AdvKind.pairing && adv.deviceNumber == devNo) {
+          target = res.device;
+          if (!completer.isCompleted) completer.complete(res.device);
+          break;
+        }
+        // Привязанное устройство (anonymous) или pairing с другим номером.
+        fallback ??= res.device;
+      }
+    });
+    try {
+      // Не await: ждём находку через completer и выходим раньше таймаута.
+      FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 8),
+        androidScanMode: AndroidScanMode.lowLatency,
+        continuousUpdates: true,
+      );
+    } catch (e) {
+      _snack('Ошибка сканирования: $e');
+    }
+    final found = await completer.future
+        .timeout(const Duration(seconds: 10), onTimeout: () => null);
+    // Гасим скан сразу, чтобы не тянуть 15 с и не мешать connect().
+    await _scanSub?.cancel();
+    await FlutterBluePlus.stopScan();
+    while (FlutterBluePlus.isScanningNow) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    return found ?? target ?? fallback;
+  }
+
+  // ---------- Подключение ----------
+  Future<bool> _connect(BluetoothDevice device) async {
+    if (_isConnecting) return false;
+    setState(() => _isConnecting = true);
+    await _scanSub?.cancel();
+    await FlutterBluePlus.stopScan();
+    while (FlutterBluePlus.isScanningNow) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    // Небольшая пауза, чтобы стек BLE успел перейти из сканирования
+    // в подключение — иначе первый connect часто отваливается.
+    await Future.delayed(const Duration(milliseconds: 300));
+
+    MetClient? client;
+    try {
+      // До трёх попыток: на Android первый connect() сразу после скана
+      // иногда рвётся на этапе GATT, повтор обычно проходит сразу.
+      for (var attempt = 0; attempt < 3; attempt++) {
+        client = MetClient(device: device, onLog: _addLog);
+        try {
+          await client.connect();
+          await client.hello();
+          break;
+        } catch (e) {
+          await client.disconnect();
+          client = null;
+          if (attempt < 2) {
+            _addLog('--', 'Повтор подключения ${attempt + 2}/3...');
+            await Future.delayed(const Duration(milliseconds: 600));
+            continue;
+          }
+          rethrow;
+        }
+      }
+      final c = client!;
+      _device = device;
+      _client = c;
+      _authed = false;
+      _addLog('--',
+          'HELLO proto=${c.info.proto} fw=${c.info.fw} '
+          'dev=${c.info.dev} paired=${c.info.paired} '
+          'timeok=${c.info.timeOk} mtu=${c.info.mtu}');
+      setState(() {});
+      return true;
+    } catch (e) {
+      _snack('Не удалось подключиться: $e');
+      await client?.disconnect();
+      return false;
     } finally {
-      _isConnecting = false;
+      if (mounted) setState(() => _isConnecting = false);
     }
   }
 
   Future<void> _disconnect() async {
-    _addBleLog("--", "Отключение");
-    await _dataSub?.cancel();
-    await _connSub?.cancel();
-    _dataSub = null;
-    _connSub = null;
-
-    try {
-      await _txChar?.setNotifyValue(false);
-    } catch (_) {}
-
-    await _device?.disconnect();
-
-    if (mounted) {
-      setState(() {
-        _device = null;
-        _rxChar = null;
-        _txChar = null;
-        _mtu = 23;
-        _isConnected = false;
-        _mcuName = "";
-        _mcuMac = "";
-        _proto = "";
-        _fw = "";
-        _mcuMtu = 0;
-        _rxBytes.clear();
-      });
-    }
-    _showSnack("Отключено");
-  }
-
-  // ==========================================================================
-  //  ПРОТОКОЛ proto=2
-  // ==========================================================================
-
-  int _nextId() {
-    _txId = (_txId >= 65535) ? 1 : _txId + 1;
-    return _txId;
-  }
-
-  /// Сериализует транзакции: одновременно активна только одна.
-  Future<T> _serialize<T>(Future<T> Function() action) {
-    final completer = Completer<T>();
-    _txnChain = _txnChain.then((_) async {
-      try {
-        completer.complete(await action());
-      } catch (e, s) {
-        completer.completeError(e, s);
-      }
+    await _client?.disconnect();
+    setState(() {
+      _client = null;
+      _device = null;
+      _authed = false;
+      _records = [];
+      _journalTotal = 0;
     });
-    return completer.future;
+    _snack('Отключено');
   }
 
-  /// Выполняет одну транзакцию: шлёт `<id> <cmd>`, собирает строки с этим
-  /// id до терминатора END/ERR. При таймауте повторяет (для чтения —
-  /// безопасно; для SET_* повтор допускается документом после таймаута).
-  Future<List<String>> _transact(String cmd, {bool retryable = true}) {
-    return _serialize(() => _transactOnce(cmd, retryable: retryable));
-  }
-
-  Future<List<String>> _transactOnce(
-    String cmd, {
-    required bool retryable,
-  }) async {
-    const maxAttempts = 3;
-    Object? lastError;
-
-    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (_rxChar == null) throw StateError("Нет характеристики записи");
-
-      final id = _nextId();
-      final active = _ActiveTxn(id);
-      _active = active;
-      _addBleLog("→ TX", "$id $cmd");
-
-      try {
-        await _writeLine("$id $cmd");
-      } catch (e) {
-        if (identical(_active, active)) _active = null;
-        rethrow;
-      }
-
-      _TxnOutcome outcome;
-      try {
-        outcome = await active.completer.future.timeout(kTxnTimeout);
-      } on TimeoutException {
-        lastError = Exception("Таймаут ответа (id=$id)");
-        _addBleLog("--", "Таймаут id=$id");
-        if (retryable && attempt < maxAttempts) continue;
-        throw lastError;
-      } finally {
-        if (identical(_active, active)) _active = null;
-      }
-
-      // ---- ERR: терминатор ошибки ----
-      if (outcome.error != null) {
-        final code = _errCode(outcome.error!);
-        final text = _errText(outcome.error!);
-        // BUSY/INTERNAL имеет смысл повторить.
-        if (retryable &&
-            attempt < maxAttempts &&
-            (code == "BUSY" || code == "INTERNAL")) {
-          _addBleLog("--", "$code, повтор id=$id");
-          continue;
-        }
-        throw ProtoException(code, text);
-      }
-
-      // ---- END: проверка полноты n ----
-      if (!_countOk(outcome)) {
-        lastError = Exception(
-            "Нарушена целостность: END n=${outcome.expectedCount}, "
-            "получено ${outcome.data.length} строк");
-        _addBleLog("--", "$lastError");
-        if (retryable && attempt < maxAttempts) continue;
-        throw lastError;
-      }
-
-      return outcome.data;
-    }
-
-    throw lastError ?? Exception("Транзакция не удалась");
-  }
-
-  /// Проверка количества строк по END `n=N`.
-  ///
-  /// В примерах протокола строка-заголовок `DEVS ... offset=... count=...`
-  /// не входит в n (считаются только строки DEV). Также информационная
-  /// строка HELLO не входит в n=0.
-  bool _countOk(_TxnOutcome o) {
-    if (o.expectedCount == null) return true;
-    final n = o.expectedCount!;
-    int payload = o.data.length;
-    if (o.data.isNotEmpty &&
-        o.data.first.startsWith("DEVS") &&
-        o.data.first.contains("offset=")) {
-      payload -= 1;
-    }
-    if (n == payload) return true;
-    if (n == 0 && payload <= 1) return true; // HELLO-ответ
-    return false;
-  }
-
-  String _errCode(String errLine) {
-    final parts = errLine.split(' ');
-    return parts.length >= 2 ? parts[1] : "INTERNAL";
-  }
-
-  String _errText(String errLine) {
-    final parts = errLine.split(' ');
-    return parts.length >= 3 ? parts.sublist(2).join(' ') : "";
-  }
-
-  /// Отправка одной строки. Команда обязана помещаться в MTU−3 и НЕ режется.
-  Future<void> _writeLine(String line) async {
-    final char = _rxChar;
-    if (char == null) throw StateError("Нет характеристики записи");
-    final data = utf8.encode("$line\n");
-    if (data.length > _maxChunkSize) {
-      throw Exception(
-          "Команда длиннее MTU−3: ${data.length} > $_maxChunkSize байт "
-          "(MTU=$_mtu). Согласуйте MTU или сократите команду.");
-    }
-    await char.write(data, withoutResponse: true);
-  }
-
-  // ---------- Приём и разбор ----------
-  void _onDataReceived(List<int> data) {
-    _addBleLog("← RX", _renderBytes(data));
-    _rxBytes.addAll(data);
-
-    while (true) {
-      final nl = _rxBytes.indexOf(0x0A);
-      if (nl < 0) {
-        // Строка ещё не завершена. Контроль переполнения.
-        if (_rxBytes.length > kMaxLine) {
-          _rxBytes.clear();
-          _addBleLog("--", "Переполнение RX (> $kMaxLine байт), сброс");
-        }
-        break;
-      }
-      final lineBytes = _rxBytes.sublist(0, nl);
-      _rxBytes.removeRange(0, nl + 1);
-      final line = utf8.decode(lineBytes, allowMalformed: true);
-      _handleLine(line);
-    }
-  }
-
-  void _handleLine(String line) {
-    final trimmed = line.replaceAll('\r', '');
-    if (trimmed.isEmpty) return;
-
-    final sp = trimmed.indexOf(' ');
-    if (sp <= 0) return; // нет ID
-
-    final id = int.tryParse(trimmed.substring(0, sp));
-    if (id == null) return;
-
-    final active = _active;
-    // Строки с чужим (или устаревшим) ID отбрасываются.
-    if (active == null || active.id != id) return;
-
-    final rest = trimmed.substring(sp + 1);
-
-    if (rest == "END" || rest.startsWith("END ")) {
-      final m = RegExp(r'^END\s+n=(\d+)$').firstMatch(rest);
-      final n = m != null ? int.parse(m.group(1)!) : null;
-      if (!active.completer.isCompleted) {
-        active.completer.complete(
-            _TxnOutcome(data: List.of(active.data), expectedCount: n));
-      }
-      return;
-    }
-
-    if (rest == "ERR" || rest.startsWith("ERR ")) {
-      if (!active.completer.isCompleted) {
-        active.completer.complete(
-            _TxnOutcome(data: List.of(active.data), error: rest));
-      }
-      return;
-    }
-
-    active.data.add(rest);
-  }
+  MetClient get _c => _client!;
 
   // ---------- Команды ----------
-  Future<void> _hello() async {
-    try {
-      final lines = await _transact("HELLO");
-      for (final l in lines) {
-        if (l.startsWith("HELLO")) {
-          if (mounted) {
-            setState(() {
-              _proto = _kv(l, "proto") ?? "";
-              _fw = _kv(l, "fw") ?? "";
-              _mcuMtu = int.tryParse(_kv(l, "mtu") ?? "") ?? 0;
-            });
-          }
-        }
-      }
-      _addBleLog("--",
-          "HELLO: proto=$_proto fw=$_fw mcuMtu=$_mcuMtu (наш MTU=$_mtu)");
-    } catch (e) {
-      _addBleLog("--", "HELLO не удался: $e");
-    }
-  }
-
-  String? _kv(String line, String key) {
-    final m = RegExp('$key=([^ ]+)').firstMatch(line);
-    return m?.group(1);
-  }
-
-  Future<void> _cmdGetName() async {
-    try {
-      final lines = await _transact("GET_NAME");
-      for (final l in lines) {
-        if (l.startsWith("NAME")) {
-          final name = l.length > 5 ? l.substring(5).trim() : "";
-          if (mounted) {
-            setState(() {
-              _mcuName = name;
-              _nameController.text = name;
-            });
-          }
-        }
-      }
-      _showSnack("Имя: ${_mcuName.isEmpty ? '—' : _mcuName}");
-    } catch (e) {
-      _showSnack("Ошибка GET_NAME: $e");
-    }
-  }
-
-  Future<void> _cmdGetMac() async {
-    try {
-      final lines = await _transact("GET_MAC");
-      for (final l in lines) {
-        if (l.startsWith("MAC")) {
-          final mac = l.length > 4 ? l.substring(4).trim() : "";
-          if (mounted) setState(() => _mcuMac = mac);
-        }
-      }
-      _showSnack("MAC: ${_mcuMac.isEmpty ? '—' : _mcuMac}");
-    } catch (e) {
-      _showSnack("Ошибка GET_MAC: $e");
-    }
-  }
-
-  Future<void> _cmdSetName(String name) async {
-    try {
-      await _transact("SET_NAME $name");
-      if (mounted) {
-        setState(() {
-          _mcuName = name;
-          _nameController.text = name;
-        });
-      }
-      _showSnack("Имя сохранено: $name");
-    } catch (e) {
-      _showSnack("Ошибка SET_NAME: $e");
-    }
-  }
-
-  Future<void> _cmdSetMac(String mac) async {
-    try {
-      await _transact("SET_MAC $mac");
-      _showSnack("MAC применён, MCU перезагружается");
-    } catch (e) {
-      _showSnack("Ошибка SET_MAC: $e");
-    }
-  }
-
-  Future<void> _cmdClearDevices() async {
-    try {
-      await _transact("CLEAR_DEVICES");
-      if (mounted) {
-        setState(() {
-          _deviceRecords = [];
-          _devicesTotal = 0;
-        });
-      }
-      _showSnack("Журнал очищен");
-    } catch (e) {
-      _showSnack("Ошибка CLEAR_DEVICES: $e");
-    }
-  }
-
-  // ---------- Страничная загрузка журнала ----------
-  Future<void> _fetchDevicesPaged() async {
-    if (_isFetchingDevices) return;
-    setState(() {
-      _isFetchingDevices = true;
-      _deviceRecords = [];
-      _devicesTotal = 0;
-    });
-
-    try {
-      // 1) Метаданные: DEVS total=<N>
-      final meta = await _transact("GET_DEVICES");
-      int? total;
-      for (final l in meta) {
-        if (l.startsWith("DEVS")) {
-          total = int.tryParse(_kv(l, "total") ?? "");
-        }
-      }
-      if (total == null) {
-        throw Exception("Не получен total из DEVS");
-      }
-      _devicesTotal = total;
-
-      if (total == 0) {
-        _showSnack("Журнал пуст");
-        return;
-      }
-
-      // 2) Страницы по kDevicesPage (10)
-      final all = <DeviceRecord>[];
-      int offset = 0;
-      while (offset < total) {
-        final lines = await _transact("GET_DEVICES $offset $kDevicesPage");
-        int count = 0;
-        for (final l in lines) {
-          if (l.startsWith("DEVS")) {
-            count = int.tryParse(_kv(l, "count") ?? "") ?? 0;
-          } else if (l.startsWith("DEV ")) {
-            final js = l.substring(4).trim();
-            try {
-              final map = json.decode(js) as Map<String, dynamic>;
-              all.add(DeviceRecord.fromJson(map));
-            } catch (_) {
-              // битую строку пропускаем
-            }
-          }
-        }
-        if (mounted) setState(() => _deviceRecords = List.of(all));
-        if (count == 0) break;
-        offset += count;
-      }
-
-      _showSnack("Загружено ${all.length} из $total");
-    } catch (e) {
-      _showSnack("Ошибка загрузки журнала: $e");
-    } finally {
-      if (mounted) setState(() => _isFetchingDevices = false);
-    }
-  }
-
-  // ---------- Журнал: файл ----------
-  String _two(int n) => n.toString().padLeft(2, '0');
-
-  String _formatLogForFile() {
-    final now = DateTime.now();
-    final buf = StringBuffer();
-
-    buf.writeln("=== BLE Tracker log ===");
-    buf.writeln("Saved:   ${now.year}-${_two(now.month)}-${_two(now.day)} "
-        "${_two(now.hour)}:${_two(now.minute)}:${_two(now.second)}");
-    buf.writeln("Device:  ${_device?.platformName ?? '?'}");
-    buf.writeln("MAC:     ${_device?.remoteId.toString() ?? '?'}");
-    buf.writeln("MCU MAC: ${_mcuMac.isEmpty ? '?' : _mcuMac}");
-    buf.writeln("MCU name:${_mcuName.isEmpty ? '?' : _mcuName}");
-    buf.writeln("Proto:   $_proto  fw=$_fw  mtu=$_mcuMtu");
-    buf.writeln("Total:   $_devicesTotal");
-    buf.writeln("----------------------");
-
-    for (final r in _deviceRecords) {
-      final name = r.name.isEmpty ? '(без имени)' : r.name;
-      buf.writeln("${r.mac}   $name   RSSI: ${r.rssi}   t: ${r.time}");
-    }
-
-    buf.writeln("=== end ===");
-    return buf.toString();
-  }
-
-  Future<void> _saveLogToFile() async {
-    if (_deviceRecords.isEmpty) {
-      _showSnack("Сначала нажмите «Обновить»");
+  Future<void> _auth() async {
+    final hex = _kOwnerCtrl.text.trim();
+    if (hex.isEmpty) {
+      _snack('Введите K_owner (hex)');
       return;
     }
     try {
-      final dir = await getApplicationDocumentsDirectory();
-      final now = DateTime.now();
-      final stamp = "${now.year}${_two(now.month)}${_two(now.day)}_"
-          "${_two(now.hour)}${_two(now.minute)}${_two(now.second)}";
-      final file = File("${dir.path}/tracker_log_$stamp.txt");
-      await file.writeAsString(_formatLogForFile());
-
-      await Share.shareXFiles(
-        [XFile(file.path, mimeType: "text/plain")],
-        subject: "BLE Tracker log $stamp",
-        text: "Журнал посещённых устройств",
-      );
-      _showSnack("Файл готов: ${file.path.split('/').last}");
+      await _c.auth(fromHex(hex));
+      setState(() => _authed = true);
+      _snack('Аутентификация пройдена');
     } catch (e) {
-      _showSnack("Ошибка сохранения: $e");
+      _snack('AUTH: $e');
     }
+  }
+
+  /// Генерирует случайный K_owner (16 байт) и подставляет в поле.
+  void _randomizeKOwner() {
+    final hex = toHex(_randomBytes(16));
+    setState(() => _kOwnerCtrl.text = hex);
+    _snack('Сгенерирован новый K_owner (16 байт)');
+  }
+
+  Future<void> _pair() async {
+    final devNo = _devNoCtrl.text.trim();
+    final kPair = _kPairCtrl.text.trim();
+    final nonce = _nonceCtrl.text.trim();
+    if (devNo.isEmpty || kPair.isEmpty || nonce.isEmpty) {
+      _snack('Заполните номер устройства, K_pair и nonce сервера');
+      return;
+    }
+    // Время берём автоматически с телефона.
+    final utc = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    try {
+      final kPairBytes = _decodeKey(kPair);
+      final kOwner = _randomBytes(16);
+      final receipt = await _c.pairFinish(
+        kPair: kPairBytes,
+        kOwner: kOwner,
+        nonce: fromHex(nonce),
+        utc: utc,
+      );
+      await MetCredentials.saveOwner(
+        deviceNumber: devNo,
+        kOwnerHex: toHex(kOwner),
+      );
+      setState(() {
+        _kOwnerHex = toHex(kOwner);
+        _deviceNumber = devNo;
+        _kOwnerCtrl.text = toHex(kOwner);
+      });
+      _addLog('--', 'RECEIPT $receipt  (отправьте на сервер)');
+      _snack('Привязка выполнена, квитанция в логе');
+    } catch (e) {
+      _snack('PAIR: $e');
+    }
+  }
+
+  Future<void> _timeSet() async {
+    final kDev = _resolveKDev();
+    if (kDev == null) {
+      _snack('Нужен K_dev (демо-поле) для подписи времени');
+      return;
+    }
+    // Время берём автоматически с телефона.
+    final utc = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    try {
+      if (!_authed) await _ensureAuth();
+      // Получаем nonce от брелока, подпись считаем ключом K_time.
+      final begin = await _c.transact('TIME_BEGIN');
+      Uint8List nonce = Uint8List(0);
+      for (final l in begin) {
+        if (l.startsWith('NONCE ')) {
+          nonce = fromHex(l.substring(6).trim());
+        }
+      }
+      final sig = timeSignature(deriveKTime(kDev), utc, nonce);
+      await _c.transact('TIME_SET $utc ${toHex(sig)}');
+      _snack('Время установлено');
+      await _c.hello();
+      setState(() {});
+    } catch (e) {
+      _snack('TIME_SET: $e');
+    }
+  }
+
+  Future<void> _fetchJournal() async {
+    if (_fetching) return;
+    setState(() {
+      _fetching = true;
+      _records = [];
+    });
+    try {
+      if (!_authed) await _ensureAuth();
+      const page = 10;
+      var offset = 0;
+      var total = 0;
+      final all = <JournalRecord>[];
+      while (true) {
+        final res = await _c.logGet(offset: offset, count: page);
+        total = res.total;
+        all.addAll(res.records);
+        if (mounted) setState(() => _records = List.of(all));
+        if (res.records.isEmpty) break;
+        offset += res.records.length;
+        if (offset >= total) break;
+      }
+      _journalTotal = total;
+      _snack('Загружено ${all.length} из $total');
+    } catch (e) {
+      _snack('LOG_GET: $e');
+    } finally {
+      if (mounted) setState(() => _fetching = false);
+    }
+  }
+
+  Future<void> _ackAll() async {
+    if (_records.isEmpty) {
+      _snack('Сначала загрузите журнал');
+      return;
+    }
+    final maxSeq = _records.map((r) => r.seq).reduce((a, b) => a > b ? a : b);
+    try {
+      final removed = await _c.logAck(maxSeq);
+      _snack('Удалено записей: $removed');
+      setState(() => _records = []);
+    } catch (e) {
+      _snack('LOG_ACK: $e');
+    }
+  }
+
+  Future<void> _battery() async {
+    try {
+      if (!_authed) await _ensureAuth();
+      final b = await _c.battery();
+      _batteryCtrl.text = '${b.pct}%  ${b.mv} mV';
+      setState(() {});
+    } catch (e) {
+      _snack('BATTERY: $e');
+    }
+  }
+
+  Future<void> _unpair() async {
+    final nonce = _nonceCtrl.text.trim();
+    if (nonce.isEmpty) {
+      _snack('Введите nonce сервера');
+      return;
+    }
+    try {
+      if (!_authed) await _ensureAuth();
+      final receipt = await _c.unpair(fromHex(nonce));
+      await MetCredentials.clearOwner();
+      setState(() {
+        _kOwnerHex = null;
+        _authed = false;
+        _records = [];
+      });
+      _addLog('--', 'RECEIPT $receipt  (отправьте на сервер)');
+      _snack('Отвязано, квитанция в логе');
+    } catch (e) {
+      _snack('UNPAIR: $e');
+    }
+  }
+
+  Future<void> _ensureAuth() async {
+    final hex = _kOwnerCtrl.text.trim();
+    if (hex.isEmpty) throw Exception('нет K_owner');
+    await _c.auth(fromHex(hex));
+    if (mounted) setState(() => _authed = true);
+  }
+
+  // ---------- Крипто-помощники ----------
+  Uint8List? _resolveKDev() {
+    if (_kDev != null) return _kDev;
+    final hex = _kDevCtrl.text.trim();
+    if (hex.isEmpty) return null;
+    try {
+      final b = fromHex(hex);
+      _kDev = b;
+      return b;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Ключ может быть задан как hex или как base32 (из QR).
+  Uint8List _decodeKey(String s) {
+    final clean = s.replaceAll(RegExp(r'[^0-9a-fA-F]'), '');
+    final looksHex = clean.length == s.length && clean.length % 2 == 0;
+    if (looksHex) return fromHex(s);
+    return base32Decode(s);
+  }
+
+  // 32-bit LCG arithmetic: exact on both the VM and JavaScript (64-bit
+  // literals are not representable as JS numbers).
+  static final _rng = Random.secure();
+  Uint8List _randomBytes(int n) {
+    final out = Uint8List(n);
+    for (var i = 0; i < n; i++) {
+      out[i] = _rng.nextInt(256);
+    }
+    return out;
   }
 
   // ---------- UI ----------
@@ -911,95 +628,102 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('BLE Tracker'),
+        title: const Text('Met Keychain'),
         actions: [
-          if (_isConnected)
+          if (_client != null)
             IconButton(
               icon: const Icon(Icons.link_off),
-              tooltip: "Отключиться",
+              tooltip: 'Отключиться',
               onPressed: _disconnect,
             ),
         ],
       ),
-      body: _isConnected ? _buildControlPanel() : _buildScanPanel(),
+      body: _client == null ? _buildScanPanel() : _buildConnectedPanel(),
     );
   }
 
   Widget _buildScanPanel() {
-    final results = _visibleScanResults;
+    final results = _visible;
     return Column(
       children: [
         Padding(
           padding: const EdgeInsets.all(12),
-          child: ElevatedButton.icon(
-            onPressed: _isScanning ? null : _startScan,
-            icon: const Icon(Icons.search),
-            label:
-                Text(_isScanning ? "Сканирование..." : "Начать сканирование"),
-            style:
-                ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50)),
+          child: Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _isScanning ? null : _startScan,
+                  icon: const Icon(Icons.search),
+                  label: Text(
+                      _isScanning ? 'Сканирование...' : 'Начать сканирование'),
+                  style: ElevatedButton.styleFrom(
+                      minimumSize: const Size.fromHeight(50)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _scanQr,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('QR-код'),
+                  style: ElevatedButton.styleFrom(
+                      minimumSize: const Size.fromHeight(50)),
+                ),
+              ),
+            ],
           ),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
           child: Row(
             children: [
-              const Text("Только ключи (0x0201)"),
+              const Text('Только Met'),
               Switch(
-                value: _onlyKeychain,
-                onChanged: (v) => setState(() => _onlyKeychain = v),
+                value: _onlyMet,
+                onChanged: (v) => setState(() => _onlyMet = v),
               ),
+              const Spacer(),
+              Text(_rssiThreshold <= -100 ? 'RSSI: любой' : 'RSSI ≥ $_rssiThreshold'),
             ],
           ),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(_rssiThreshold <= -100
-                  ? "Сигнал: любой"
-                  : "Сигнал: ≥ $_rssiThreshold dBm"),
-              Slider(
-                min: -100,
-                max: -40,
-                divisions: 60,
-                value: _rssiThreshold.toDouble(),
-                label: _rssiThreshold <= -100
-                    ? "любой"
-                    : "$_rssiThreshold dBm",
-                onChanged: (v) =>
-                    setState(() => _rssiThreshold = v.round()),
-              ),
-            ],
+          child: Slider(
+            min: -100,
+            max: -40,
+            divisions: 60,
+            value: _rssiThreshold.toDouble(),
+            onChanged: (v) => setState(() => _rssiThreshold = v.round()),
           ),
         ),
         Expanded(
           child: results.isEmpty
-              ? const Center(child: Text("Устройства не найдены"))
+              ? const Center(child: Text('Устройства не найдены'))
               : ListView.builder(
                   itemCount: results.length,
                   itemBuilder: (context, i) {
                     final r = results[i];
-                    final isKey = _isKeychain(r.advertisementData);
-                    // advName объединяет основной ADV и scan response,
-                    // поэтому полное имя ключа (ScanResponse.addName())
-                    // появится здесь благодаря активному сканированию.
-                    final advName = r.advertisementData.advName;
-                    final platformName = r.device.platformName;
-                    final name = advName.isNotEmpty
-                        ? advName
-                        : (platformName.isNotEmpty
-                            ? platformName
-                            : "(без имени)");
+                    final adv = _metAdv(r);
+                    final name = adv?.kind == AdvKind.pairing
+                        ? (adv?.deviceNumber ?? '(pairing)')
+                        : adv?.kind == AdvKind.anonymous
+                            ? 'Met (anon)'
+                            : (r.device.platformName.isEmpty
+                                ? '(без имени)'
+                                : r.device.platformName);
                     return ListTile(
                       leading: Icon(
-                        isKey ? Icons.vpn_key : Icons.bluetooth,
-                        color: isKey ? Colors.orange : null,
+                        adv != null ? Icons.vpn_key : Icons.bluetooth,
+                        color: adv?.kind == AdvKind.pairing
+                            ? Colors.orange
+                            : adv != null
+                                ? Colors.green
+                                : null,
                       ),
                       title: Text(name),
-                      subtitle: Text("${r.device.remoteId}  RSSI: ${r.rssi}"
-                          "${isKey ? '  • ключ 0x0201' : ''}"),
+                      subtitle: Text('${r.device.remoteId}  RSSI: ${r.rssi}'
+                          '${adv != null ? '  v${adv.version}' : ''}'),
                       onTap: () => _connect(r.device),
                     );
                   },
@@ -1009,16 +733,16 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _buildControlPanel() {
+  Widget _buildConnectedPanel() {
     return DefaultTabController(
       length: 3,
       child: Column(
         children: [
           const TabBar(
             tabs: [
-              Tab(icon: Icon(Icons.tune), text: "Управление"),
-              Tab(icon: Icon(Icons.list_alt), text: "Журнал"),
-              Tab(icon: Icon(Icons.terminal), text: "Логи BLE"),
+              Tab(icon: Icon(Icons.tune), text: 'Управление'),
+              Tab(icon: Icon(Icons.list_alt), text: 'Журнал'),
+              Tab(icon: Icon(Icons.terminal), text: 'Логи'),
             ],
           ),
           Expanded(
@@ -1026,7 +750,7 @@ class _HomePageState extends State<HomePage> {
               children: [
                 _buildControlTab(),
                 _buildJournalTab(),
-                _buildBleLogsTab(),
+                _buildLogsTab(),
               ],
             ),
           ),
@@ -1035,96 +759,137 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ---------- Вкладка «Управление» ----------
+  Widget _card(String title, List<Widget> children) => Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              ...children,
+            ],
+          ),
+        ),
+      );
+
+  Widget _field(TextEditingController c, String label,
+          {bool obscure = false}) =>
+      Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: TextField(
+          controller: c,
+          obscureText: obscure,
+          decoration: InputDecoration(
+            labelText: label,
+            border: const OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+      );
+
   Widget _buildControlTab() {
+    final info = _c.info;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text("Подключено: ${_device?.platformName ?? ''}",
-                      style: const TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 6),
-                  Text("BLE MAC: ${_device?.remoteId.toString() ?? '—'}"),
-                  Text("MCU MAC: ${_mcuMac.isEmpty ? '—' : _mcuMac}"),
-                  Text("Имя MCU: ${_mcuName.isEmpty ? '—' : _mcuName}"),
-                  Text("Proto: ${_proto.isEmpty ? '—' : _proto}  "
-                      "fw: ${_fw.isEmpty ? '—' : _fw}  "
-                      "mtu(MCU): ${_mcuMtu == 0 ? '—' : _mcuMtu}"),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _cmdGetName,
-                          icon: const Icon(Icons.badge),
-                          label: const Text("Имя"),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: _cmdGetMac,
-                          icon: const Icon(Icons.memory),
-                          label: const Text("MAC"),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
+          _card('Устройство', [
+            Text('BLE MAC: ${_device?.remoteId.toString() ?? '—'}'),
+            Text('Номер: ${info.dev.isEmpty ? '—' : info.dev}'),
+            Text('Proto: ${info.proto}  fw: ${info.fw}'),
+            Text('Привязан: ${info.paired ? 'да' : 'нет'}   '
+                'Время: ${info.timeOk ? 'ок' : 'нет'}   MTU: ${info.mtu}'),
+            Text('Владелец: ${_authed ? 'аутентифицирован' : 'нет'}'),
+            Text('Сохранено: ${_kOwnerHex ?? '—'}'
+                '${_deviceNumber == null ? '' : '  ($_deviceNumber)'}'),
+          ]),
 
-          _card("Изменить имя", [
-            TextField(
-              controller: _nameController,
-              decoration: const InputDecoration(
-                labelText: "Новое имя",
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 8),
-            ElevatedButton.icon(
-              onPressed: () {
-                final n = _nameController.text.trim();
-                if (n.isEmpty) {
-                  _showSnack("Введите имя");
-                  return;
-                }
-                _cmdSetName(n);
-              },
-              icon: const Icon(Icons.save),
-              label: const Text("Применить"),
+          _card('Аутентификация (K_owner)', [
+            _field(_kOwnerCtrl, 'K_owner (hex)'),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    onPressed: _auth,
+                    icon: const Icon(Icons.lock_open),
+                    label: const Text('AUTH'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _randomizeKOwner,
+                  icon: const Icon(Icons.casino),
+                  label: const Text('RANDOM'),
+                ),
+              ],
             ),
           ]),
 
-          _card("Изменить MAC (перезагрузка MCU)", [
-            TextField(
-              controller: _macController,
-              decoration: const InputDecoration(
-                labelText: "AA:BB:CC:DD:EE:FF",
-                border: OutlineInputBorder(),
-              ),
+          _card('Привязка (K_pair)', [
+            _field(_devNoCtrl, 'Номер устройства (MET-00001)'),
+            _field(_kPairCtrl, 'K_pair (hex или base32 из QR)'),
+            _field(_nonceCtrl, 'Nonce от сервера (hex)'),
+            ElevatedButton.icon(
+              onPressed: _pair,
+              icon: const Icon(Icons.key),
+              label: const Text('PAIR'),
             ),
+          ]),
+
+          _card('Часы (подпись сервера)', [
+            _field(_kDevCtrl, 'K_dev (hex, только для демо)'),
+            const Text('В демо приложение само считает HMAC(K_time, utc‖nonce). '
+                'В продакшене подпись приходит с сервера.',
+                style: TextStyle(fontSize: 12, color: Colors.black54)),
             const SizedBox(height: 8),
             ElevatedButton.icon(
-              onPressed: () {
-                final m = _macController.text.trim();
-                if (m.isEmpty) {
-                  _showSnack("Введите MAC");
-                  return;
-                }
-                _cmdSetMac(m);
-              },
-              icon: const Icon(Icons.wifi_tethering),
-              label: const Text("Применить и перезагрузить"),
+              onPressed: _timeSet,
+              icon: const Icon(Icons.schedule),
+              label: const Text('TIME_SET'),
+            ),
+          ]),
+
+          _card('Питание и настройки', [
+            _field(_batteryCtrl, 'Батарея'),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _battery,
+                  icon: const Icon(Icons.battery_full),
+                  label: const Text('BATTERY'),
+                ),
+                ElevatedButton(
+                  onPressed: () => _c.setRssi(-70),
+                  child: const Text('SET_RSSI -70'),
+                ),
+                ElevatedButton(
+                  onPressed: () => _c.setAdvInterval(500),
+                  child: const Text('ADV 500ms'),
+                ),
+                ElevatedButton(
+                  onPressed: () => _c.setAdvTx(0),
+                  child: const Text('ADV_TX 0dBm'),
+                ),
+                ElevatedButton(
+                  onPressed: () => _c.setScan(600, 10000),
+                  child: const Text('SCAN 600/10000'),
+                ),
+              ],
+            ),
+          ]),
+
+          _card('Отвязка', [
+            const Text('Используется nonce сервера из поля выше.'),
+            const SizedBox(height: 8),
+            ElevatedButton.icon(
+              onPressed: _unpair,
+              icon: const Icon(Icons.link_off),
+              label: const Text('UNPAIR'),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             ),
           ]),
         ],
@@ -1132,95 +897,81 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ---------- Вкладка «Журнал» ----------
   Widget _buildJournalTab() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
-      child: _card("Посещённые устройства", [
+      child: _card('Журнал встреч', [
         Row(
           children: [
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: _isFetchingDevices ? null : _fetchDevicesPaged,
-                icon: _isFetchingDevices
+                onPressed: _fetching ? null : _fetchJournal,
+                icon: _fetching
                     ? const SizedBox(
                         width: 18,
                         height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
+                        child: CircularProgressIndicator(strokeWidth: 2))
                     : const Icon(Icons.refresh),
-                label: Text(_isFetchingDevices ? "Загрузка..." : "Обновить"),
+                label: Text(_fetching ? 'Загрузка...' : 'Обновить'),
               ),
             ),
             const SizedBox(width: 8),
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: _saveLogToFile,
-                icon: const Icon(Icons.save_alt),
-                label: const Text("Сохранить"),
-                style:
-                    ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                onPressed: _ackAll,
+                icon: const Icon(Icons.cloud_done),
+                label: const Text('LOG_ACK'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
               ),
             ),
           ],
         ),
         const SizedBox(height: 8),
-        Text("Всего: $_devicesTotal, загружено: ${_deviceRecords.length}"),
+        Text('Всего: $_journalTotal, загружено: ${_records.length}'),
         const SizedBox(height: 8),
-        Text(_formatDeviceList()),
-        const SizedBox(height: 8),
-        ElevatedButton.icon(
-          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-          onPressed: _cmdClearDevices,
-          icon: const Icon(Icons.delete),
-          label: const Text("Очистить журнал"),
-        ),
+        if (_records.isEmpty)
+          const Text('(пусто)')
+        else
+          ..._records.map((r) {
+            final t1 = DateTime.fromMillisecondsSinceEpoch(r.tFirst * 1000)
+                .toUtc()
+                .toIso8601String();
+            return Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Text(
+                'seq=${r.seq}  id=${toHex(r.id).substring(0, 16)}…  '
+                't=$t1  rssi=${r.rssi}  n=${r.count}',
+                style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+              ),
+            );
+          }),
       ]),
     );
   }
 
-  String _formatDeviceList() {
-    if (_deviceRecords.isEmpty) return "(пусто)";
-    final buf = StringBuffer();
-    for (final r in _deviceRecords) {
-      final name = r.name.isEmpty ? '(без имени)' : r.name;
-      buf.writeln("• ${r.mac}   $name   RSSI: ${r.rssi}");
-    }
-    return buf.toString();
-  }
-
-  // ---------- Вкладка «Логи BLE» ----------
-  Widget _buildBleLogsTab() {
+  Widget _buildLogsTab() {
     return Padding(
       padding: const EdgeInsets.all(12),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             children: [
               Expanded(
                 child: ElevatedButton.icon(
                   onPressed: () {
-                    setState(() => _bleLogs.clear());
-                    _showSnack("Логи очищены");
+                    setState(() => _logs.clear());
+                    _snack('Логи очищены');
                   },
                   icon: const Icon(Icons.delete_sweep),
-                  label: const Text("Очистить логи"),
+                  label: const Text('Очистить'),
                   style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
                 ),
               ),
               const SizedBox(width: 8),
-              Expanded(
-                child: Row(
-                  children: [
-                    const Text("Автоскролл"),
-                    Switch(
-                      value: _bleLogsAutoScroll,
-                      onChanged: (v) =>
-                          setState(() => _bleLogsAutoScroll = v),
-                    ),
-                  ],
-                ),
+              const Text('Автоскролл'),
+              Switch(
+                value: _autoScroll,
+                onChanged: (v) => setState(() => _autoScroll = v),
               ),
             ],
           ),
@@ -1232,24 +983,22 @@ class _HomePageState extends State<HomePage> {
                 borderRadius: BorderRadius.circular(6),
               ),
               padding: const EdgeInsets.all(8),
-              child: _bleLogs.isEmpty
+              child: _logs.isEmpty
                   ? const Center(
-                      child: Text(
-                        "Пока нет записей",
-                        style: TextStyle(color: Colors.white54),
-                      ),
-                    )
+                      child: Text('Пока нет записей',
+                          style: TextStyle(color: Colors.white54)))
                   : ListView.builder(
-                      controller: _bleLogsScroll,
-                      itemCount: _bleLogs.length,
+                      controller: _logsScroll,
+                      itemCount: _logs.length,
                       itemBuilder: (context, i) {
-                        final line = _bleLogs[i];
+                        final line = _logs[i];
                         Color color = Colors.white70;
-                        if (line.contains("→ TX")) {
+                        if (line.contains('→ TX')) {
                           color = Colors.lightBlueAccent;
-                        } else if (line.contains("← RX")) {
+                        } else if (line.contains('← RX') ||
+                            line.contains('RECEIPT')) {
                           color = Colors.lightGreenAccent;
-                        } else if (line.contains("--")) {
+                        } else if (line.contains('--')) {
                           color = Colors.orangeAccent;
                         }
                         return Text(
@@ -1266,34 +1015,6 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _card(String title, List<Widget> children) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
-            ...children,
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _renderBytes(List<int> data) {
-    final txt = utf8.decode(data, allowMalformed: true);
-    return txt.replaceAll('\r', '').replaceAll('\n', '\\n');
-  }
-
-  void _showSnack(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
     );
   }
 }

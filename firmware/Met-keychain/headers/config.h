@@ -5,7 +5,15 @@
 
 // 1 = Serial включён (отладка), 0 = выключен (батарея).
 // USB CDC держит PHY включённым и тянет ~0.5–1 mA, поэтому в релизе выключаем.
-#define ENABLE_SERIAL 0
+#define ENABLE_SERIAL 1
+
+// Mirror logs onto hardware UART (Serial1) for an external USB-UART (CH341).
+// This survives USB-CDC re-enumeration during resets, unlike Serial.
+// nice!nano default UART pins: TX = P0.06 (D0), RX = P0.08 (D1).
+// Wiring to CH341: board TX -> CH341 RX, GND <-> GND, 115200 baud.
+#define ENABLE_UART_MIRROR 1
+#define UART_MIRROR_TX_PIN 6
+#define UART_MIRROR_RX_PIN 8
 
 #if ENABLE_SERIAL
   #define LOG(...)   Serial.printf(__VA_ARGS__)
@@ -15,68 +23,53 @@
   #define LOGLN(s)   do {} while (0)
 #endif
 
-// --- BLE UART TX-очередь ---
-// Ответы формируются в RX-callback и складываются в очередь, а физическая
-// отправка (notify) выполняется из loop(). Это исключает вызов delay() и
-// блокирующих операций внутри callback, из-за которых BLE-стек реентерабельно
-// вызывал rxCallback и дублировал/рвал ответы (обрыв на границе MTU).
+#if ENABLE_UART_MIRROR
+  #define ULOG(...)   Serial1.printf(__VA_ARGS__)
+  #define ULOGLN(s)   Serial1.println(s)
+#else
+  #define ULOG(...)   do {} while (0)
+  #define ULOGLN(s)   do {} while (0)
+#endif
 
-// Максимум ответов, ожидающих отправки. При переполнении новые дропаются.
+// --- BLE UART TX-очередь ---
+// Ответы формируются в RX-callback и складываются в очередь, физическая
+// отправка (notify) выполняется из loop(). См. PROTOCOL.md.
 #define TX_QUEUE_MAX 16
 
-// Примечание: bufferTXD(true) НЕ используется. Он копит данные во внутреннем
-// FIFO стека и write() всегда возвращает len, из-за чего нельзя понять,
-// ушёл ли notify. Вместо этого txPump() шлёт notify напрямую куском
-// (MTU - 3) и повторяет попытку, пока write() не вернёт ненулевое число.
-
-// --- BLE-протокол (см. protocol_ble.txt) ---
-#define PROTO_VERSION   2
-#define FW_VERSION      "1.4.0"
+// --- Протокол BLE (см. PROTOCOL.md) ---
+#define PROTO_VERSION   3
+#define FW_VERSION      "2.0.0"
 
 // Фиксированный максимум длины строки протокола (запрос и ответ).
-#define MAX_LINE        200
+#define MAX_LINE        220
 
-// Максимум записей журнала в одной странице ответа GET_DEVICES.
-// Каждая запись — отдельная строка "DEV {...}", поэтому лимит связан
-// с размером TX-очереди, а не с длиной строки.
-#define DEVICES_PAGE_MAX 10
+// Максимум записей журнала встреч в одной странице ответа LOG_GET.
+#define LOG_PAGE_MAX    6
 
-// --- Обнаружение «своих» устройств (pairing) ---
-// Цель: два устройства с этой прошивкой должны надёжно находить друг друга.
-// Чужие BLE-устройства (телефоны, наушники и т.п.) игнорируются.
+// --- Метка Met в рекламе ---
+// Manufacturer data: company ID (2, LE) | 'M' 'e' 't' | version | payload...
+#define MET_COMPANY_ID   0xFFFF
+#define MET_ADV_VERSION  1
+#define MET_PAYLOAD_ANON 0x01   // анонимный ID (привязан и знает время)
+#define MET_PAYLOAD_PAIR 0x02   // номер устройства (режим привязки)
 
-// 1 = принимать только устройства с нашим 16-бит UUID (baseUuid16).
-// 0 = принимать всё (для отладки). Для поиска своих ДОЛЖНО быть 1.
-#define SCAN_FILTER_BY_UUID 1
+// --- Радиопараметры (стартовые, настраиваются по BLE) ---
+#define ADV_INTERVAL_MS_DEFAULT   200    // интервал рекламы, мс (чаще = быстрее находят)
+#define ADV_TX_POWER_DBM_DEFAULT  4      // мощность передатчика, dBm (макс. дальность)
+#define SCAN_WINDOW_MS_DEFAULT    9000   // окно скана, мс
+#define SCAN_PERIOD_MS_DEFAULT    10000  // период скана, мс (~90% duty — слушаем почти всегда)
 
-// 1 = активное сканирование (SCAN_RSP → имена). Для своих устройств
-// держим включённым, чтобы видеть имя и подтверждать «свой» ADV.
-#define SCAN_ACTIVE 1
+// Порог RSSI (dBm): слабее — не пишем. Старт: -90 (ловить и дальние/слабые пакеты).
+#define RSSI_THRESHOLD_DEFAULT (-90)
 
-// Интервал/окно сканирования в единицах 0.625 мс. Для максимальной
-// вероятности обнаружения окно = интервал (100% duty): сканер слушает
-// непрерывно, а не 50% времени. 160 = 100 мс.
-#define SCAN_INTERVAL 160
-#define SCAN_WINDOW   160
+// Склейка одного и того же ID, увиденного снова в пределах 2 мин.
+#define ENCOUNTER_MERGE_MS 120000
 
-// Минимальный RSSI (dBm) для попадания в журнал. Свои устройства обычно
-// рядом, поэтому отсекаем шум. 0 = без отсечения.
-#define SCAN_MIN_RSSI (-100)
+// Эпоха анонимного ID: 900 с (15 мин).
+#define ANON_EPOCH_SECONDS 900
 
-// Дедупликация: не обновлять запись чаще, чем раз в N мс (защита flash).
-#define SCAN_DEVICE_REFRESH_MS 1000
-
-// --- Агрессивный ADV для быстрого обнаружения ---
-// Интервал рекламы в единицах 0.625 мс: 160 = 100 мс (быстрый режим),
-// 8000 = 5 с (энергосбережение). В fast-режиме устройство чаще
-// «кричит» о себе, и партнёр находит его за секунды.
-#define ADV_INTERVAL_FAST 160     // 100 мс
-#define ADV_INTERVAL_SLOW 8000    // 5 с
-// Сколько секунд держать fast-режим после старта/дисконнекта,
-// затем перейти в slow для экономии батареи. 0 = всегда fast.
-#define ADV_FAST_TIMEOUT_S 30
-
-// Сообщаемое в HELLO значение MTU (согласование реализуется отдельно).
-#define PROTO_MTU_REPORT 247
+// Защита от перебора: после N неверных ответов — пауза (мс).
+#define AUTH_MAX_FAILS   3
+#define AUTH_LOCKOUT_MS  30000
 
 #endif

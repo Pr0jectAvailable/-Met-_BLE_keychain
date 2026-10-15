@@ -7,7 +7,8 @@ plugins {
 android {
     namespace = "com.example.ble_android_app"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // NDK r27+ is required for 16 KB page size alignment (Google Play requirement).
+    ndkVersion = "28.2.13676358"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -27,6 +28,13 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+    }
+
+    packaging {
+        // Do not compress native libs; keep 16 KB alignment intact.
+        jniLibs {
+            useLegacyPackaging = false
+        }
     }
 
     buildTypes {
