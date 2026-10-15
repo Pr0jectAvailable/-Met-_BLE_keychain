@@ -62,9 +62,10 @@
 
 // --- Радиопараметры (стартовые, настраиваются по BLE) ---
 #define ADV_INTERVAL_MS_DEFAULT   200    // интервал рекламы, мс (чаще = быстрее находят)
-#define ADV_TX_POWER_DBM_DEFAULT  4      // мощность передатчика, dBm (макс. дальность)
-#define SCAN_WINDOW_MS_DEFAULT    9000   // окно скана, мс
-#define SCAN_PERIOD_MS_DEFAULT    10000  // период скана, мс (~90% duty — слушаем почти всегда)
+#define ADV_TX_POWER_DBM_DEFAULT  0      // мощность передатчика, dBm (снижено: +4dBm при 90%
+                                         // duty скана давал brown-out/сброс на USB-питании)
+#define SCAN_WINDOW_MS_DEFAULT    3000   // окно скана, мс
+#define SCAN_PERIOD_MS_DEFAULT    10000  // период скана, мс (30% duty: стабильно, без перегрева/сброса)
 
 // Порог RSSI (dBm): слабее — не пишем. Старт: -90 (ловить и дальние/слабые пакеты).
 #define RSSI_THRESHOLD_DEFAULT (-90)

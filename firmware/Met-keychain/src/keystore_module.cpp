@@ -84,6 +84,19 @@ void KeystoreModule::load() {
         save();
         LOGLN("Keystore: radio params migrated for better discovery.");
     }
+
+    // Миграция "высоконагруженных" радио-параметров: 90% duty скана (9000/10000)
+    // и +4dBm одновременно на USB-питании давали brown-out/сброс (reset_reas=0x0,
+    // bootcnt растёт). Понижаем duty и TX, чтобы МК не перезагружался и не
+    // терял RAM-часы (иначе timeok=0 -> брелок уходит в pairing beacon).
+    if (s_rec.scanWindowMs == 9000 && s_rec.scanPeriodMs == 10000 &&
+        s_rec.advTxPowerDbm == 4) {
+        s_rec.scanWindowMs = SCAN_WINDOW_MS_DEFAULT;
+        s_rec.scanPeriodMs = SCAN_PERIOD_MS_DEFAULT;
+        s_rec.advTxPowerDbm = ADV_TX_POWER_DBM_DEFAULT;
+        save();
+        LOGLN("Keystore: radio params de-rated (scan duty/TX) to stop resets.");
+    }
 }
 
 void KeystoreModule::save() {

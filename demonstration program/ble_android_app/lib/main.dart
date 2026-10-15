@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'package:mobile_scanner/mobile_scanner.dart';
 
@@ -544,6 +547,40 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _saveJournalToFile() async {
+    if (_records.isEmpty) {
+      _snack('Сначала загрузите журнал');
+      return;
+    }
+    try {
+      final buf = StringBuffer();
+      buf.writeln('# MET journal total=$_journalTotal records=${_records.length}');
+      buf.writeln('# seq  id  tFirst(UTC)  tLast(UTC)  rssi  count  tag');
+      for (final r in _records) {
+        final t1 = DateTime.fromMillisecondsSinceEpoch(r.tFirst * 1000)
+            .toUtc()
+            .toIso8601String();
+        final t2 = DateTime.fromMillisecondsSinceEpoch(r.tLast * 1000)
+            .toUtc()
+            .toIso8601String();
+        buf.writeln('${r.seq}  ${toHex(r.id)}  $t1  $t2  '
+            '${r.rssi}  ${r.count}  ${toHex(r.tag)}');
+      }
+      final dir = await getApplicationDocumentsDirectory();
+      final stamp = DateTime.now()
+          .toUtc()
+          .toIso8601String()
+          .replaceAll(':', '-')
+          .replaceAll('.', '-');
+      final file = File('${dir.path}/met_journal_$stamp.txt');
+      await file.writeAsString(buf.toString());
+      _snack('Сохранено: ${file.path}');
+      await Share.shareXFiles([XFile(file.path)], text: 'MET journal');
+    } catch (e) {
+      _snack('SAVE: $e');
+    }
+  }
+
   Future<void> _ackAll() async {
     if (_records.isEmpty) {
       _snack('Сначала загрузите журнал');
@@ -934,6 +971,15 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
           ],
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: _records.isEmpty ? null : _saveJournalToFile,
+            icon: const Icon(Icons.save_alt),
+            label: const Text('Сохранить в TXT'),
+          ),
         ),
         const SizedBox(height: 8),
         Text('Всего: $_journalTotal, загружено: ${_records.length}'),

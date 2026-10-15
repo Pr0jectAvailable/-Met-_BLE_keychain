@@ -183,6 +183,11 @@ void StorageModule::load() {
 void StorageModule::save() {
     // Атомарная запись: сначала во временный файл + CRC, затем переименование.
     // Пропадание питания больше не оставляет пустой/битый журнал.
+    // DIAG: считаем и логируем каждую запись во flash. Частые save() во время
+    // активного скана/BLE — главный подозреваемый на LOCKUP/сброс SoftDevice.
+    static uint32_t s_saveCount = 0;
+    s_saveCount++;
+    LOG("Journal: save #%u recCount=%d\n", (unsigned)s_saveCount, recCount);
     size_t dataLen = sizeof(Encounter) * recCount;
     uint32_t crc = crc32((const uint8_t*)records, dataLen);
 

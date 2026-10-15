@@ -15,24 +15,35 @@ static uint32_t s_advSeen = 0;
 static uint32_t s_advRecorded = 0;
 static uint32_t s_rawReports = 0;   // DIAG: все отчёты сканера (до парсинга)
 
+// Запрос на перезапуск радио (скан+реклама) из основного контекста.
+// Ставится в onDisconnect (контекст события SoftDevice) и обрабатывается
+// в BLEModule::loop(): запускать скан/рекламу прямо в обработчике события
+// нельзя — стек уходит в рассинхрон (raw=0) и МК сбрасывается.
+static volatile bool s_radioRestartPending = false;
+
 // --- Буфер отчётов сканера (producer/consumer) ---
 // scanCallback() выполняется в контексте события SoftDevice (ISR). Любая
 // блокирующая работа там (Serial LOG, HMAC в computeTag(), запись во
 // flash в save()) срывает тайминги SoftDevice и приводит к сбросу МК.
 // Поэтому колбэк только копирует отчёт в ring-buffer и сразу возвращает
 // управление; разбор/фильтрация/record() делаются в loop().
+#define SCAN_RAW_MAX 31
 struct ScanReport {
     uint8_t peerMac[6];      // в порядке отображения (addr[5-i])
     uint8_t payload[16];
     uint8_t payloadLen;
     uint8_t type;
     int8_t  rssi;
+    bool    parsed;          // прошёл parseMetAdv (Met-реклама)
+    uint8_t raw[SCAN_RAW_MAX]; // DIAG: сырые данные рекламы
+    uint8_t rawLen;
 };
 #define SCAN_QUEUE_SIZE 16
 static ScanReport         s_scanQueue[SCAN_QUEUE_SIZE];
 static volatile uint8_t   s_scanHead = 0;
 static volatile uint8_t   s_scanTail = 0;
 static volatile uint32_t  s_scanDropped = 0;
+static uint32_t           s_rawDumped = 0;  // DIAG: сколько отчётов уже выгрузили
 void BLEModule::markAdvStopped() { advRunning = false; }
 
 // companyID(2,LE) | 'M' 'e' 't' | ver | type | payload
@@ -85,17 +96,14 @@ static void onDisconnect(uint16_t conn_handle, uint8_t reason) {
     // Сброс сессии: иначе следующий телефон остаётся "владельцем"
     // (LOG_GET/UNPAIR без повторного AUTH). Также чистит TX-очередь.
     BLEUartModule::resetSession();
-    // Возобновляем скан только если он реально нужен (провижининг +
-    // валидное время). Иначе оставляем эфир рекламе, чтобы брелок
-    // оставался обнаружимым для --list / повторного провижининга.
-    if (KeystoreModule::provisioned() && KeystoreModule::timeValid()) {
-        Bluefruit.Scanner.start(0);
-    }
-    // Пересобираем рекламу: пока телефон был подключён, TIME_SET мог
-    // сделать время валидным, и брелок должен уйти с pairing beacon на
-    // анонимный ID — иначе пиры его игнорируют (MET_PAYLOAD_ANON).
-    BLEModule::restartAdvertising();
+    // ВАЖНО: ничего радио-связанного здесь не делаем. Этот колбэк
+    // выполняется в контексте события SoftDevice; запуск скана и рекламы
+    // прямо в нём (вместе с restartOnDisconnect) приводил к тому, что скан
+    // «running», но отчётов нет (raw=0), и к сбросам МК. Откладываем в loop().
+    BLEModule::requestRadioRestart();
 }
+
+void BLEModule::requestRadioRestart() { s_radioRestartPending = true; }
 
 void BLEModule::begin() {
     // Bluefruit.begin() уже вызван в setup() до регистрации колбэков.
@@ -128,7 +136,10 @@ void BLEModule::begin() {
     LOGLN("BLE scan DISABLED (power test build).");
 #endif
 
-    Bluefruit.Advertising.restartOnDisconnect(true);
+    // Рекламу после отключения поднимаем сами в loop() (requestRadioRestart),
+    // чтобы не стартовать её в контексте события SoftDevice одновременно со
+    // сканом — это и вызывало рассинхрон и сбросы.
+    Bluefruit.Advertising.restartOnDisconnect(false);
 
     updateAnonId();
     buildAdvertising();
@@ -138,6 +149,17 @@ void BLEModule::loop() {
     // Разбираем накопленные сканером отчёты (HMAC/журнал/лог) ЗДЕСЬ, в
     // основном контексте, а не в ISR-колбэке SoftDevice.
     processScanQueue();
+
+    // Отложенный перезапуск радио после отключения телефона.
+    if (s_radioRestartPending && !Bluefruit.connected()) {
+        s_radioRestartPending = false;
+        if (KeystoreModule::provisioned() && KeystoreModule::timeValid() &&
+            !Bluefruit.Scanner.isRunning()) {
+            Bluefruit.Scanner.start(0);
+            LOGLN("BLE scan (re)started after disconnect.");
+        }
+        restartAdvertising();
+    }
     // Смену MAC/рекламы на ходу не делаем при активном соединении:
     // Bluefruit.setAddr() в этом случае рвёт линк. Отложим до отключения.
     if (Bluefruit.connected()) return;
@@ -149,6 +171,20 @@ void BLEModule::loop() {
             updateAnonId();
             restartAdvertising();
         }
+    }
+    // Heartbeat раз в ~5 с: если он пропадает — МК завис/сбросился, а не
+    // «просто ничего не услышал». uptime показывает, сбрасывалось ли время
+    // (uptime мал после сброса) без ожидания BOOT-блока.
+    static uint32_t s_lastBeat = 0;
+    if (millis() - s_lastBeat > 5000) {
+        s_lastBeat = millis();
+        // DIAG: heap free/total + a stack sentinel via local address. A steadily
+        // falling free heap before the reset points to a leak (Strings/queue).
+        LOG("HB up=%lus conn=%u scanRun=%u advRun=%u heap=%u/%u\n",
+            (unsigned long)(millis() / 1000),
+            (unsigned)Bluefruit.connected(),
+            (unsigned)Bluefruit.Scanner.isRunning(), (unsigned)advRunning,
+            (unsigned)dbgHeapFree(), (unsigned)dbgHeapTotal());
     }
     // Диагностика раз в ~30 с: сколько Met-ADV услышано и записано.
     static uint32_t s_lastStat = 0;
@@ -163,6 +199,10 @@ void BLEModule::loop() {
 }
 
 void BLEModule::rotateMac() {
+    // DIAG: маркер входа. Если последний лог перед сбросом — это "rotateMac",
+    // значит виновата последовательность stop-scan/set-addr/start-scan/adv.
+    LOG("RotateMAC: enter (scanRun=%u advRun=%u)\n",
+        (unsigned)Bluefruit.Scanner.isRunning(), (unsigned)advRunning);
     uint8_t rnd[6];
     if (!CryptoModule::random(rnd, 6)) return;
 
@@ -278,25 +318,31 @@ void BLEModule::scanCallback(ble_gap_evt_adv_report_t* report) {
     uint8_t payload[24];
     uint8_t payloadLen = sizeof(payload);
 
-    if (parseMetAdv(report->data.p_data, report->data.len,
-                    &type, payload, &payloadLen)) {
-        uint8_t head = s_scanHead;
-        uint8_t next = (uint8_t)((head + 1) % SCAN_QUEUE_SIZE);
-        if (next != s_scanTail) {
-            ScanReport& r = s_scanQueue[head];
-            for (int i = 0; i < 6; i++) r.peerMac[i] = report->peer_addr.addr[5 - i];
-            r.type = type;
-            r.rssi = report->rssi;
-            uint8_t pl = payloadLen;
-            if (pl > sizeof(r.payload)) pl = sizeof(r.payload);
-            memcpy(r.payload, payload, pl);
-            r.payloadLen = pl;
-            __DMB();              // данные записаны до публикации head
-            s_scanHead = next;
-            s_advSeen++;
-        } else {
-            s_scanDropped++;      // очередь переполнена — отчёт теряется
-        }
+    bool ok = parseMetAdv(report->data.p_data, report->data.len,
+                          &type, payload, &payloadLen);
+
+    uint8_t head = s_scanHead;
+    uint8_t next = (uint8_t)((head + 1) % SCAN_QUEUE_SIZE);
+    if (next != s_scanTail) {
+        ScanReport& r = s_scanQueue[head];
+        for (int i = 0; i < 6; i++) r.peerMac[i] = report->peer_addr.addr[5 - i];
+        r.rssi = report->rssi;
+        r.parsed = ok;
+        r.type = type;
+        uint8_t pl = ok ? payloadLen : 0;
+        if (pl > sizeof(r.payload)) pl = sizeof(r.payload);
+        if (ok) memcpy(r.payload, payload, pl);
+        r.payloadLen = pl;
+        // DIAG: копируем сырые данные рекламы для выгрузки в loop().
+        uint8_t rl = report->data.len;
+        if (rl > SCAN_RAW_MAX) rl = SCAN_RAW_MAX;
+        memcpy(r.raw, report->data.p_data, rl);
+        r.rawLen = rl;
+        __DMB();              // данные записаны до публикации head
+        s_scanHead = next;
+        if (ok) s_advSeen++;
+    } else {
+        s_scanDropped++;      // очередь переполнена — отчёт теряется
     }
     // SoftDevice останавливает скан после каждого отчёта — продолжаем.
     Bluefruit.Scanner.resume();
@@ -307,6 +353,27 @@ void BLEModule::processScanQueue() {
         ScanReport r = s_scanQueue[s_scanTail];
         s_scanTail = (uint8_t)((s_scanTail + 1) % SCAN_QUEUE_SIZE);
 
+        // DIAG: первые 40 отчётов выгружаем целиком (hex) — понять, что
+        // реально в эфире и почему seen=0 при raw>0.
+        if (s_rawDumped < 40) {
+            s_rawDumped++;
+            char hex[3 * SCAN_RAW_MAX + 1];
+            size_t n = 0;
+            for (uint8_t i = 0; i < r.rawLen; i++)
+                n += snprintf(hex + n, sizeof(hex) - n, "%02X ", r.raw[i]);
+            // NEARMISS: в сырых данных есть сигнатура 'M''e''t', но парсер
+            // не признал её (проблема формата), в отличие от «нет в эфире».
+            bool metBytes = false;
+            for (uint8_t i = 0; i + 4 < r.rawLen; i++)
+                if (r.raw[i] == 'M' && r.raw[i+1] == 'e' && r.raw[i+2] == 't') {
+                    metBytes = true; break;
+                }
+            LOG("ScanRaw #%u rssi=%d len=%u parsed=%u metBytes=%u: %s\n",
+                (unsigned)s_rawDumped, (int)r.rssi, (unsigned)r.rawLen,
+                (unsigned)r.parsed, (unsigned)metBytes, hex);
+        }
+
+        if (!r.parsed) continue;
         if (r.rssi < KeystoreModule::rssiThreshold()) continue;
         if (memcmp(r.peerMac, currentMac, 6) == 0) continue;
 

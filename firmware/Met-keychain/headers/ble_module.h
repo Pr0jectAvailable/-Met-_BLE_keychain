@@ -10,6 +10,7 @@ public:
     static void loop();
     static void restartAdvertising();
     static void markAdvStopped();
+    static void requestRadioRestart();
     static uint32_t advSeen();
     static uint32_t advRecorded();
 
