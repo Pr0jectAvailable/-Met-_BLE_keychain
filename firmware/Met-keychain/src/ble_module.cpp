@@ -21,6 +21,12 @@ static uint32_t s_rawReports = 0;   // DIAG: все отчёты сканера 
 // нельзя — стек уходит в рассинхрон (raw=0) и МК сбрасывается.
 static volatile bool s_radioRestartPending = false;
 
+// Отложенный сброс сессии и запись журнала на диск после разрыва связи.
+// onDisconnect() работает в контексте события SoftDevice: flush() (запись во
+// flash) и resetSession() там блокируют стек и рвут тайминги, поэтому делаем
+// это в loop() (см. firmware-fixes.md P0-1б).
+static volatile bool s_disconnectPending = false;
+
 // --- Буфер отчётов сканера (producer/consumer) ---
 // scanCallback() выполняется в контексте события SoftDevice (ISR). Любая
 // блокирующая работа там (Serial LOG, HMAC в computeTag(), запись во
@@ -91,15 +97,11 @@ static void onConnect(uint16_t conn_handle) {
 
 static void onDisconnect(uint16_t conn_handle, uint8_t reason) {
     LOG("BLE disconnected: handle=%u reason=0x%02X\n", conn_handle, reason);
-    // Сбрасываем RAM-журнал на диск, пока есть питание.
-    StorageModule::flush();
-    // Сброс сессии: иначе следующий телефон остаётся "владельцем"
-    // (LOG_GET/UNPAIR без повторного AUTH). Также чистит TX-очередь.
-    BLEUartModule::resetSession();
-    // ВАЖНО: ничего радио-связанного здесь не делаем. Этот колбэк
-    // выполняется в контексте события SoftDevice; запуск скана и рекламы
-    // прямо в нём (вместе с restartOnDisconnect) приводил к тому, что скан
-    // «running», но отчётов нет (raw=0), и к сбросам МК. Откладываем в loop().
+    // ВАЖНО: ничего тяжёлого (flash, String, радио) здесь не делаем — это
+    // контекст события SoftDevice. Запись журнала и сброс сессии откладываем
+    // в loop() через s_disconnectPending, перезапуск радио — через
+    // requestRadioRestart() (см. firmware-fixes.md P0-1б).
+    s_disconnectPending = true;
     BLEModule::requestRadioRestart();
 }
 
@@ -146,6 +148,14 @@ void BLEModule::begin() {
 }
 
 void BLEModule::loop() {
+    // Отложенная обработка разрыва связи (см. onDisconnect): сброс RAM-журнала
+    // на диск и сброс сессии выполняем в основной задаче.
+    if (s_disconnectPending) {
+        s_disconnectPending = false;
+        StorageModule::flush();
+        BLEUartModule::resetSession();
+    }
+
     // Разбираем накопленные сканером отчёты (HMAC/журнал/лог) ЗДЕСЬ, в
     // основном контексте, а не в ISR-колбэке SoftDevice.
     processScanQueue();

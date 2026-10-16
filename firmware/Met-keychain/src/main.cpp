@@ -14,6 +14,16 @@ static uint32_t g_resetReas = 0;
 static char g_resetStr[96] = {0};
 static uint32_t g_bootCount = 0;
 
+// --- Время, переживающее мягкий сброс -------------------------------------
+// .noinit не обнуляется стартовым кодом; при потере питания секция всё равно
+// стирается, поэтому подделать время извне нельзя. См. firmware-fixes.md P0-3.
+struct RetainedClock { uint32_t magic, utc, crc; };
+__attribute__((section(".noinit"))) static RetainedClock s_keep;
+static const uint32_t KEEP_MAGIC = 0x4D455443; // 'METC'
+static uint32_t keepCrc(uint32_t utc) {
+    return (KEEP_MAGIC ^ utc) * 2654435761u + 0x9E3779B9u;
+}
+
 // Persistent boot counter in InternalFS: survives power loss (unlike RAM),
 // so a rapidly increasing value proves the MCU is reset-looping.
 static void bumpBootCount() {
@@ -124,6 +134,20 @@ void setup() {
     InternalFS.begin();
     bumpBootCount();
     KeystoreModule::begin();
+
+    // Восстанавливаем время после мягкого сброса (WDT/LOCKUP/SOFT), но НЕ
+    // после power-on/RESETPIN: g_resetReas прочитан и очищен выше.
+    {
+        uint32_t soft = POWER_RESETREAS_DOG_Msk | POWER_RESETREAS_LOCKUP_Msk |
+                        POWER_RESETREAS_SREQ_Msk;
+        if ((g_resetReas & soft) && s_keep.magic == KEEP_MAGIC &&
+            s_keep.crc == keepCrc(s_keep.utc)) {
+            KeystoreModule::setUtc(s_keep.utc + 2);  // + время на перезагрузку
+            LOGLN("Clock: restored from .noinit after soft reset");
+            ULOGLN("Clock: restored from .noinit after soft reset");
+        }
+    }
+
     StorageModule::begin();
     CryptoModule::begin();
 
@@ -136,6 +160,14 @@ void setup() {
     StorageModule::clear();
     LOGLN("FACTORY_WIPE_ON_BOOT: keys + journal cleared");
 #endif
+
+    // WDT: если loop() не крутится 8 с — аппаратный сброс. Работает и при
+    // HardFault/LOCKUP. Кормим в loop(); остановить до сброса нельзя.
+    NRF_WDT->CONFIG = (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos) |
+                      (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos);
+    NRF_WDT->CRV    = 8 * 32768;          // 8 с при 32.768 кГц
+    NRF_WDT->RREN   = WDT_RREN_RR0_Msk;
+    NRF_WDT->TASKS_START = 1;
 
     // ATT MTU: должен быть задан до Bluefruit.begin().
     Bluefruit.configPrphConn(247, BLE_GAP_EVENT_LENGTH_DEFAULT,
@@ -150,6 +182,22 @@ void setup() {
 }
 
 void loop() {
+    // Кормим WDT: если loop() встанет дольше 8 с — аппаратный сброс.
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+
+    // Раз в ~1 с обновляем .noinit-копию времени для восстановления после
+    // мягкого сброса (см. firmware-fixes.md P0-3).
+    static uint32_t s_keepMs = 0;
+    if (millis() - s_keepMs > 1000) {
+        s_keepMs = millis();
+        if (KeystoreModule::timeValid()) {
+            uint32_t u = KeystoreModule::utc();
+            s_keep.magic = KEEP_MAGIC;
+            s_keep.utc = u;
+            s_keep.crc = keepCrc(u);
+        }
+    }
+
     BLEUartModule::loop();
     BLEModule::loop();
     StorageModule::loop();

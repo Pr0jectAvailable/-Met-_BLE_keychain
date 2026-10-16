@@ -19,6 +19,20 @@ bool     BLEUartModule::txClosing = false;
 
 static const uint32_t TX_STALL_TIMEOUT_MS = 5000;
 
+// --- Кольцо входящих команд -------------------------------------------------
+// rxCallback() выполняется в контексте задачи Bluefruit/SoftDevice, а loop() —
+// в основной. Раньше команды исполнялись прямо в колбэке, из-за чего две
+// задачи без блокировок трогали txQueue, records[], ключи и радио -> HardFault.
+// Теперь колбэк только складывает готовые строки в кольцо, а processCommand()
+// вызывается из loop() (см. firmware-fixes.md P0-1б).
+#define CMD_RING 4
+static char              s_cmd[CMD_RING][MAX_LINE + 1];
+static volatile uint8_t  s_cmdHead = 0, s_cmdTail = 0;
+// Сборка строки из фрагментов notify (только в контексте колбэка).
+static char              s_rxBuf[MAX_LINE + 1];
+static size_t            s_rxLen = 0;
+static bool              s_rxOverflow = false;
+
 // Состояние challenge-response.
 static uint8_t  s_challenge[16];
 static bool     s_challengeActive = false;
@@ -37,6 +51,12 @@ void BLEUartModule::resetSession() {
     s_challengeActive = false;
     s_authFails = 0;
     s_lockoutUntil = 0;
+    // Обрывок строки прошлого телефона не должен приклеиваться к первой
+    // команде следующего, а необработанные команды — исполняться после
+    // переподключения (см. firmware-fixes.md P0-1б).
+    s_rxLen = 0;
+    s_rxOverflow = false;
+    s_cmdTail = s_cmdHead;
     // Сбрасываем и TX-состояние: незавершённая транзакция предыдущего
     // соединения не должна блокировать (BUSY) следующий телефон.
     std::queue<String> empty;
@@ -59,6 +79,13 @@ uint16_t BLEUartModule::currentMtu() {
 }
 
 void BLEUartModule::loop() {
+    // Выполняем накопленные команды здесь, в одной задаче с BLEModule/Storage.
+    while (s_cmdTail != s_cmdHead) {
+        String line(s_cmd[s_cmdTail]);
+        s_cmdTail = (uint8_t)((s_cmdTail + 1) % CMD_RING);
+        line.trim();
+        if (line.length() > 0) processCommand(line);
+    }
     txPump();
     if (activeId != 0 &&
         (uint32_t)(millis() - txDeadlineMs) > TX_STALL_TIMEOUT_MS) {
@@ -141,24 +168,33 @@ void BLEUartModule::rxCallback(uint16_t conn_handle) {
     if (len <= 0) return;
     buffer[len] = '\0';
     LOG("RX %d bytes: '%s'\n", len, buffer);
-    static String cmdBuffer = "";
-    static bool overflow = false;
+    // ВАЖНО: это контекст задачи Bluefruit/SoftDevice. Никаких аллокаций
+    // (String), криптографии и записи во flash. Только сборка строки и
+    // копирование в кольцо; исполнение — в loop().
     for (int i = 0; i < len; i++) {
         char c = buffer[i];
         if (c == '\n' || c == '\r') {
-            if (overflow) { if (c == '\n') overflow = false; cmdBuffer = ""; continue; }
-            cmdBuffer.trim();
-            if (cmdBuffer.length() > 0) {
-                LOG("CMD line: '%s'\n", cmdBuffer.c_str());
-                processCommand(cmdBuffer);
+            if (s_rxOverflow) {
+                if (c == '\n') s_rxOverflow = false;
+                s_rxLen = 0;
+                continue;
             }
-            cmdBuffer = "";
-        } else if (!overflow) {
-            cmdBuffer += c;
-            if (cmdBuffer.length() > MAX_LINE) {
-                cmdBuffer = ""; overflow = true;
-                enqueueResponse("0 ERR TOO_LONG line too long\n");
-            }
+            if (s_rxLen == 0) continue;
+            s_rxBuf[s_rxLen] = '\0';
+            uint8_t next = (uint8_t)((s_cmdHead + 1) % CMD_RING);
+            if (next != s_cmdTail) {
+                strncpy(s_cmd[s_cmdHead], s_rxBuf, MAX_LINE);
+                s_cmd[s_cmdHead][MAX_LINE] = '\0';
+                __DMB();
+                s_cmdHead = next;
+            }   // иначе — переполнение, телефон получит тайм-аут и повторит
+            s_rxLen = 0;
+        } else if (!s_rxOverflow) {
+            if (s_rxLen < MAX_LINE) {
+                s_rxBuf[s_rxLen++] = c;
+            } else {
+                s_rxLen = 0; s_rxOverflow = true;
+            }   // строка длиннее MAX_LINE — молча ждём '\n' и тайм-аута
         }
     }
 }
@@ -285,7 +321,7 @@ void BLEUartModule::processCommand(const String& line) {
         if (!KeystoreModule::provision(devNoStr.c_str(), kDev, kPair)) {
             errTransaction("PROV_FAIL", ""); return;
         }
-        BLEModule::restartAdvertising();
+        BLEModule::requestRadioRestart();
         enqueueResponse(String(activeId) + " OK dev=" + KeystoreModule::devNo() + "\n");
         endTransaction();
         return;
@@ -317,7 +353,7 @@ void BLEUartModule::processCommand(const String& line) {
         KeystoreModule::factoryReset();
         StorageModule::clear();
         s_ownerAuthed = false;
-        BLEModule::restartAdvertising();
+        BLEModule::requestRadioRestart();
         enqueueResponse(String(activeId) + " OK\n");
         endTransaction();
         return;
@@ -351,7 +387,7 @@ void BLEUartModule::processCommand(const String& line) {
         KeystoreModule::factoryReset();
         StorageModule::clear();
         s_ownerAuthed = false;
-        BLEModule::restartAdvertising();
+        BLEModule::requestRadioRestart();
         enqueueResponse(String(activeId) + " OK\n");
         endTransaction();
         return;
@@ -505,7 +541,7 @@ void BLEUartModule::processCommand(const String& line) {
         s_challengeActive = false;
         LOG("TIME: server time accepted utc=%u\n", (unsigned)utc);
         KeystoreModule::setUtc(utc);
-        BLEModule::loop();
+        BLEModule::requestRadioRestart();
         enqueueResponse(String(activeId) + " OK\n");
         endTransaction();
         return;
@@ -601,7 +637,7 @@ void BLEUartModule::processCommand(const String& line) {
         KeystoreModule::unpair();
         StorageModule::clear();
         s_ownerAuthed = false;
-        BLEModule::restartAdvertising();
+        BLEModule::requestRadioRestart();
         enqueueData(String("RECEIPT ") + toHex(receipt, 32));
         endTransaction();
         return;
@@ -643,7 +679,7 @@ void BLEUartModule::processCommand(const String& line) {
         s_ownerAuthed = false;
         s_authFails = 0;
         s_lockoutUntil = 0;
-        BLEModule::restartAdvertising();
+        BLEModule::requestRadioRestart();
         enqueueResponse(String(activeId) + " OK dev=" + KeystoreModule::devNo() + "\n");
         endTransaction();
         return;

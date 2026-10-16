@@ -22,9 +22,12 @@
   #define ENABLE_BLE_SCAN 1
 #endif
 
+// Логи пишем только если в TX-буфере USB CDC есть место. При выдернутом
+// кабеле tud_cdc_connected() может остаться true, и Serial.printf() ждёт
+// место в буфере вечно, блокируя loop() (см. firmware-fixes.md, P0-2).
 #if ENABLE_SERIAL
-  #define LOG(...)   Serial.printf(__VA_ARGS__)
-  #define LOGLN(s)   Serial.println(s)
+  #define LOG(...)   do { if (Serial && Serial.availableForWrite() > 64) Serial.printf(__VA_ARGS__); } while (0)
+  #define LOGLN(s)   do { if (Serial && Serial.availableForWrite() > 64) Serial.println(s); } while (0)
 #else
   #define LOG(...)   do {} while (0)
   #define LOGLN(s)   do {} while (0)

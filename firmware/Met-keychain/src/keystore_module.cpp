@@ -34,6 +34,13 @@ struct KeyRecord {
 
 static KeyRecord s_rec;
 
+// Текущий счётчик seq живёт в RAM; s_rec.seq — зарезервированная «верхняя
+// граница». save() вызывается только когда RAM-счётчик доходит до границы,
+// поэтому на каждую встречу flash больше не пишется (см. firmware-fixes.md
+// P0-4). После сброса пропускаем до 32 номеров — серверу нужна только
+// монотонность. Формат файла не меняется: граница хранится в s_rec.seq.
+static uint32_t s_seq = 0;
+
 // CRC32 (IEEE 802.3) для контроля целостности слота ключей.
 static uint32_t ks_crc32(const uint8_t* data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
@@ -109,6 +116,9 @@ void KeystoreModule::load() {
     if (ok0 && (!ok1 || g0 >= g1)) { s_rec = r0; s_activeSlot = 0; s_gen = g0; }
     else                           { s_rec = r1; s_activeSlot = 1; s_gen = g1; }
     s_rec.devNo[sizeof(s_rec.devNo) - 1] = '\0';
+    // Возобновляем счёт с сохранённой границы резерва: номера ниже неё могли
+    // быть выданы до сброса, повторно их не используем.
+    s_seq = s_rec.seq;
     LOG("Keystore: devNo=%s paired=%u seq=%u gen=%u slot=%u\n", s_rec.devNo,
         (unsigned)(s_rec.flags & 1), (unsigned)s_rec.seq,
         (unsigned)s_gen, (unsigned)s_activeSlot);
@@ -199,6 +209,7 @@ bool KeystoreModule::provision(const char* devNo, const uint8_t kDev[16],
     memset(s_rec.kOwner, 0, 16);
     s_rec.flags = 0;
     s_rec.seq = 0;
+    s_seq = 0;
     save();
     LOG("Keystore: provisioned dev=%s\n", s_rec.devNo);
     return true;
@@ -215,11 +226,15 @@ bool KeystoreModule::deriveRcpt(uint8_t out[32]) {
 }
 
 uint32_t KeystoreModule::nextSeq() {
-    uint32_t s = s_rec.seq; s_rec.seq = s + 1; save();
+    uint32_t s = s_seq++;                 // счётчик — только в RAM
+    if (s_seq >= s_rec.seq) {             // резерв исчерпан — пишем следующий блок
+        s_rec.seq = s_seq + 32;
+        save();
+    }
     LOG("Keystore: nextSeq=%u\n", (unsigned)s);
     return s;
 }
-uint32_t KeystoreModule::peekSeq() { return s_rec.seq; }
+uint32_t KeystoreModule::peekSeq() { return s_seq; }
 
 bool KeystoreModule::timeValid() { return s_timeValid; }
 
@@ -271,6 +286,7 @@ void KeystoreModule::factoryReset() {
     LOGLN("Keystore: FACTORY RESET, clearing devNo/K_dev/K_pair/K_owner.");
     // Сохраняем только счётчик seq (он монотонно растёт и не сбрасывается)
     // и настроенные параметры радио — их перезапись не нарушает протокол.
+    // keepSeq уже является зарезервированной границей — с неё и возобновляем.
     uint32_t keepSeq = s_rec.seq;
     uint16_t advI = s_rec.advIntervalMs;
     uint16_t scanW = s_rec.scanWindowMs;
@@ -279,6 +295,7 @@ void KeystoreModule::factoryReset() {
     int8_t   rssi = s_rec.rssiThreshold;
     setDefaults();
     s_rec.seq = keepSeq;
+    s_seq = keepSeq;
     s_rec.advIntervalMs = advI;
     s_rec.scanWindowMs = scanW;
     s_rec.scanPeriodMs = scanP;
