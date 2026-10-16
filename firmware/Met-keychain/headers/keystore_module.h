@@ -64,7 +64,14 @@ public:
     static void factoryReset();
 
 private:
+    // Двойная буферизация ключей: два слота, в каждом запись с монотонным
+    // поколением (gen) и CRC. Пишем всегда в неактивный слот, поэтому
+    // сброс/пропадание питания в любой момент оставляет хотя бы один
+    // валидный файл. См. KeystoreModule::save()/load().
     static const char* KEY_FILE;
+    static const char* ALT_FILE;
+    static uint8_t  s_activeSlot;   // 0 = KEY_FILE, 1 = ALT_FILE
+    static uint32_t s_gen;          // поколение последней валидной записи
     static void load();
     static void save();
 
